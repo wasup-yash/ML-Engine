@@ -4,10 +4,12 @@ A lightweight engine for serving machine learning models via a REST API.
 
 ## Features
 
-- Load ML models saved in standard formats (joblib, pickle)
+- Load ML models saved in standard formats (joblib, pickle, onnx, pytorch, Tensorflow Savedmodel)
 - Expose models through a FastAPI-based REST API
 - Configure via command-line arguments or YAML configuration files
 - Built-in logging
+- Async Inference (Async API endpoints via FastAPI)
+- Batch Intference
 
 ## Quick Start
 
