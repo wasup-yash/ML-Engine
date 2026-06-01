@@ -1,5 +1,22 @@
 model_path: "./model.joblib"   
 model_format: null             
+quantization: null
+adapter_path: null
+merge_adapter: false
+batch_max_wait_ms: 20
+batch_max_size: 32
+multimodal_model_path: null
+model_card_path: null
+retrieval_index_path: null
+retrieval_top_k: 3
+retrieval_embedding_dim: 512
+video_stream_media_type: "application/jsonl"
+benchmark_warmup_calls: 20
+benchmark_timed_calls: 100
+metrics_gpu_poll_interval_sec: 1.0
+model_variants: {}
+traffic_split: {}
+shadow_model: null
 
 host: "127.0.0.1"             
 port: 5000                    

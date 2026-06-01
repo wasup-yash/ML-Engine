@@ -1,0 +1,15 @@
+# Use a base image with Python
+FROM python:3.13-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the necessary files into the container
+COPY requirement.txt requirement.txt
+COPY create_sample_model.py create_sample_model.py
+
+# Install the required Python libraries
+RUN pip install -r requirement.txt
+
+# Run the Python script when the container starts
+CMD ["python", "create_sample_model.py"]

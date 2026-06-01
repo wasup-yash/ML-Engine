@@ -5,11 +5,23 @@ A lightweight engine for serving machine learning models via a REST API.
 ## Features
 
 - Load ML models saved in standard formats (joblib, pickle, onnx, pytorch, Tensorflow Savedmodel)
-- Expose models through a FastAPI-based REST API
-- Configure via command-line arguments or YAML configuration files
-- Built-in logging
-- Async Inference (Async API endpoints via FastAPI)
-- Batch Intference
+ - Added a /predict_multimodal endpoint accepting image + text payloads, routing to a VLA model (e.g. LLaVA, OpenVLA) for grounded predictions
+- a multimodal retrieval pipeline — embed uploaded images/text into a vector store and retrieve relevant context before inference
+- Added a /finetune endpoint that accepts a small labelled dataset and runs LoRA/QLoRA fine-tuning on a loaded base model in-place, then hot-swaps the adapter weights without server restart
+- Support loading models with merged or separate LoRA adapter files (.safetensors) alongside the base model, configurable via YAML
+
+ - Added a /predict_video endpoint that accepts a sequence of frames and runs temporal inference (useful for action recognition or latent diffusion pipelines)
+- Support loading rectified flow / diffusion model checkpoints (.safetensors, diffusers format) as a first-class model format in model_loader.py
+
+- Added INT8/INT4 quantisation support via bitsandbytes or torch.ao.quantization at model load time, configurable with a quantization key in the YAML config
+- Implemented dynamic batching with configurable max_wait_ms and max_batch_size to maximise GPU throughput under concurrent requests
+Add a /benchmark endpoint that runs a warmup + timed inference loop and reports latency percentiles (p50/p95/p99) and throughput
+
+- Observability / MLOps support
+
+  - Expose a /metrics endpoint (Prometheus-compatible) tracking inference latency, batch sizes, model load time, and GPU memory utilisation via pynvml
+
+- Added model versioning support — load multiple model variants and route traffic between them via a config-driven A/B split or shadow mode
 
 ## Quick Start
 
@@ -107,6 +119,10 @@ model.fit(X, y)
 
 joblib.dump(model, "model.joblib")
 ```
+
+## Phases
+
+![These are the phases for feature implementation](/ml_engine_feature_plan.svg)
 
 ## License
 

@@ -16,12 +16,16 @@ def main():
     try: 
         model = load_model(
             model_path=config["model_path"],
-            format=config.get("model_format")
+            format=config.get("model_format"),
+            quantization=config.get("quantization"),
+            adapter_path=config.get("adapter_path"),
+            merge_adapter=bool(config.get("merge_adapter", False)),
         )   
         server = APIServer(
             model=model,
             host=config["host"],
-            port=config["port"]
+            port=config["port"],
+            config=None,
         ) 
         server.run()
         
