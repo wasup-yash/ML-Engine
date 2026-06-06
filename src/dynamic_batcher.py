@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from typing import Any, Awaitable, Callable, List, Tuple
+from typing import Any, Callable, List, Tuple
 
 
 class AsyncBatcher:
@@ -34,7 +34,7 @@ class AsyncBatcher:
             result = await self.infer_fn(batch_inputs)
         else:
             maybe_awaitable = await asyncio.to_thread(self.infer_fn, batch_inputs)
-            if isinstance(maybe_awaitable, Awaitable):
+            if inspect.isawaitable(maybe_awaitable):
                 result = await maybe_awaitable
             else:
                 result = maybe_awaitable

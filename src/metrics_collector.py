@@ -28,7 +28,7 @@ class MetricsCollector:
             "Observed request batch sizes",
             labelnames=("endpoint",),
             registry=self.registry,
-            buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256, float("inf")),
+            buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256),
         )
         self.gpu_memory_used_bytes = Gauge(
             "gpu_memory_used_bytes",

@@ -5,11 +5,21 @@ from typing import Any, Dict, Optional
 
 import torch
 from PIL import Image
-from transformers import AutoModel, AutoModelForVision2Seq, AutoProcessor, CLIPModel
+from transformers import AutoModel, AutoProcessor, CLIPModel
 
 from src.logger import get_logger
 
 logger = get_logger(__name__)
+
+try:
+    from transformers import AutoModelForVision2Seq  # type: ignore
+except Exception:
+    AutoModelForVision2Seq = None  # type: ignore
+
+try:
+    from transformers import AutoModelForImageTextToText  # type: ignore
+except Exception:
+    AutoModelForImageTextToText = None  # type: ignore
 
 
 @dataclass
@@ -105,7 +115,14 @@ def load_multimodal_model(config: Dict[str, Any]) -> MultimodalBundle:
         model = CLIPModel.from_pretrained(model_path, trust_remote_code=True)
     elif model_type in {"llava", "openvla", "vision2seq", "multimodal"}:
         try:
-            model = AutoModelForVision2Seq.from_pretrained(model_path, trust_remote_code=True)
+            if AutoModelForVision2Seq is not None:
+                model = AutoModelForVision2Seq.from_pretrained(model_path, trust_remote_code=True)
+            elif AutoModelForImageTextToText is not None:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path, trust_remote_code=True
+                )
+            else:
+                raise RuntimeError("No vision-to-seq auto model class available in transformers")
         except Exception:
             model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     else:
@@ -161,7 +178,16 @@ def run_multimodal_inference(
     with torch.no_grad():
         if hasattr(bundle.model, "generate"):
             output_tokens = bundle.model.generate(**inputs, max_new_tokens=max_new_tokens)
-            decoded = bundle.processor.batch_decode(output_tokens, skip_special_tokens=True)
+            if hasattr(bundle.processor, "batch_decode"):
+                decoded = bundle.processor.batch_decode(output_tokens, skip_special_tokens=True)
+            elif hasattr(bundle.processor, "tokenizer") and hasattr(
+                bundle.processor.tokenizer, "batch_decode"
+            ):
+                decoded = bundle.processor.tokenizer.batch_decode(
+                    output_tokens, skip_special_tokens=True
+                )
+            else:
+                decoded = [str(output_tokens)]
             prediction = decoded[0] if decoded else ""
         else:
             raw = bundle.model(**inputs)
