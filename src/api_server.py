@@ -101,8 +101,11 @@ class APIServer:
 
     async def _shutdown(self) -> None:
         await self.infer_batcher.close()
-        for task in list(self._background_tasks):
+        tasks = list(self._background_tasks)
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.metrics.stop_gpu_poller()
 
     def _build_model_registry(self, default_model: Any) -> ModelRegistry:

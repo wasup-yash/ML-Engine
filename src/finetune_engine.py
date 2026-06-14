@@ -1,8 +1,7 @@
 import os
-from datetime import datetime
 from typing import Any, Dict, List
+from uuid import uuid4
 
-from src.adapter_loader import load_adapter
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -29,7 +28,7 @@ def _build_training_text(record: Dict[str, Any]) -> str:
 def run_lora_finetune(model: Any, dataset: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from datasets import Dataset
-        from peft import LoraConfig, TaskType, get_peft_model
+        from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
         from transformers import AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments
     except ImportError as e:
         raise ImportError("finetune dependencies missing: transformers/datasets/peft") from e
@@ -46,7 +45,12 @@ def run_lora_finetune(model: Any, dataset: List[Dict[str, Any]], config: Dict[st
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_id, use_fast=True)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            if hasattr(model, "resize_token_embeddings"):
+                model.resize_token_embeddings(len(tokenizer))
 
     training_texts = [_build_training_text(item) for item in dataset]
     hf_dataset = Dataset.from_dict({"text": training_texts})
@@ -72,11 +76,12 @@ def run_lora_finetune(model: Any, dataset: List[Dict[str, Any]], config: Dict[st
         task_type=TaskType.CAUSAL_LM,
         target_modules=config.get("lora_target_modules"),
     )
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        model = prepare_model_for_kbit_training(model)
     peft_model = get_peft_model(model, lora_config)
 
     output_root = config.get("adapter_output_dir", "./adapters")
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(output_root, f"adapter_{timestamp}")
+    output_dir = os.path.join(output_root, f"adapter_{uuid4().hex}")
     os.makedirs(output_dir, exist_ok=True)
 
     training_args = TrainingArguments(
@@ -103,10 +108,7 @@ def run_lora_finetune(model: Any, dataset: List[Dict[str, Any]], config: Dict[st
     peft_model.save_pretrained(output_dir, safe_serialization=True)
     logger.info(f"Saved adapter to {output_dir}")
 
-    hot_swapped_model = load_adapter(model, output_dir)
-    logger.info("Hot-swapped model with newly trained adapter")
-
     return {
-        "model": hot_swapped_model,
+        "model": peft_model,
         "adapter_path": output_dir,
     }

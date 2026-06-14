@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 from typing import Any, Dict
 
@@ -50,6 +51,8 @@ def load_config_from_yaml(config_path: str) -> Dict[str, Any]:
     logger.info(f"Loading configuration from {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError("Configuration root must be a YAML mapping")
     logger.info("Configuration loaded successfully")
     return config
 
@@ -166,7 +169,7 @@ def parse_args() -> Dict[str, Any]:
 
 
 def get_config() -> Dict[str, Any]:
-    config = DEFAULT_CONFIG.copy()
+    config = copy.deepcopy(DEFAULT_CONFIG)
     args = parse_args()
 
     if "config" in args:

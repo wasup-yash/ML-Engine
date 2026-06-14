@@ -84,6 +84,7 @@ class MetricsCollector:
     def start_gpu_poller(self) -> None:
         if self._gpu_thread and self._gpu_thread.is_alive():
             return
+        self._stop_event.clear()
         self._gpu_thread = threading.Thread(target=self._gpu_poll_loop, daemon=True, name="gpu-metrics-poller")
         self._gpu_thread.start()
 
