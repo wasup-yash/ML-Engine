@@ -108,25 +108,32 @@ def load_multimodal_model(config: Dict[str, Any]) -> MultimodalBundle:
 
     model_type = detect_model_type(config)
     logger.info(f"Loading multimodal model {model_path} as type={model_type}")
+    trust_remote_code = bool(config.get("multimodal_trust_remote_code", False))
 
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
 
     if model_type == "clip":
-        model = CLIPModel.from_pretrained(model_path, trust_remote_code=True)
+        model = CLIPModel.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     elif model_type in {"llava", "openvla", "vision2seq", "multimodal"}:
         try:
             if AutoModelForVision2Seq is not None:
-                model = AutoModelForVision2Seq.from_pretrained(model_path, trust_remote_code=True)
+                model = AutoModelForVision2Seq.from_pretrained(
+                    model_path, trust_remote_code=trust_remote_code
+                )
             elif AutoModelForImageTextToText is not None:
                 model = AutoModelForImageTextToText.from_pretrained(
-                    model_path, trust_remote_code=True
+                    model_path, trust_remote_code=trust_remote_code
                 )
             else:
                 raise RuntimeError("No vision-to-seq auto model class available in transformers")
         except Exception:
-            model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+            model = AutoModel.from_pretrained(
+                model_path, trust_remote_code=trust_remote_code
+            )
     else:
-        model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_path, trust_remote_code=trust_remote_code)
 
     if torch.cuda.is_available():
         model = model.to("cuda")
@@ -148,6 +155,10 @@ def run_multimodal_inference(
     max_new_tokens: int = 128,
 ) -> Dict[str, Any]:
     prompt = _build_prompt(text, retrieved_context)
+    try:
+        device = next(bundle.model.parameters()).device
+    except (AttributeError, StopIteration):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if bundle.model_type == "clip":
         if image is None:
@@ -159,9 +170,8 @@ def run_multimodal_inference(
             padding=True,
             truncation=True,
         )
-        if torch.cuda.is_available():
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
-        with torch.no_grad():
+        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        with torch.inference_mode():
             outputs = bundle.model(**inputs)
             similarity = outputs.logits_per_image.squeeze().float().cpu().item()
         return {"type": "clip_similarity", "score": similarity}
@@ -170,14 +180,16 @@ def run_multimodal_inference(
     if image is not None:
         processor_kwargs["images"] = image
     inputs = bundle.processor(**processor_kwargs)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     for key, value in list(inputs.items()):
         if hasattr(value, "to"):
             inputs[key] = value.to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         if hasattr(bundle.model, "generate"):
             output_tokens = bundle.model.generate(**inputs, max_new_tokens=max_new_tokens)
+            input_ids = inputs.get("input_ids")
+            if input_ids is not None and output_tokens.shape[-1] > input_ids.shape[-1]:
+                output_tokens = output_tokens[:, input_ids.shape[-1] :]
             if hasattr(bundle.processor, "batch_decode"):
                 decoded = bundle.processor.batch_decode(output_tokens, skip_special_tokens=True)
             elif hasattr(bundle.processor, "tokenizer") and hasattr(

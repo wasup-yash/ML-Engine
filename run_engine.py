@@ -25,7 +25,7 @@ def main():
             model=model,
             host=config["host"],
             port=config["port"],
-            config=None,
+            config=config,
         ) 
         server.run()
         

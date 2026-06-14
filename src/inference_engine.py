@@ -1,6 +1,17 @@
 import numpy as np
 from typing import Any, List
-import onnxruntime
+
+
+def _is_onnx_session(model: Any) -> bool:
+    return model.__class__.__module__.startswith("onnxruntime") and hasattr(model, "run")
+
+
+def _to_list(value: Any) -> List[Any]:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
 
 def batch_inference(model: Any, inputs: List[Any], batch_size: int) -> List[Any]:
     """
@@ -18,12 +29,22 @@ def batch_inference(model: Any, inputs: List[Any], batch_size: int) -> List[Any]
     for i in range(0, len(inputs), batch_size):
         batch = inputs[i:i + batch_size]
         if hasattr(model, "predict"):
-            # For models with a `predict` method (e.g., scikit-learn, XGBoost)
-            results.extend(model.predict(batch))
-        elif isinstance(model, onnxruntime.InferenceSession):
-            # For ONNX models
+            results.extend(_to_list(model.predict(batch)))
+        elif _is_onnx_session(model):
             input_name = model.get_inputs()[0].name
-            results.extend(model.run(None, {input_name: np.array(batch)})[0])
+            results.extend(_to_list(model.run(None, {input_name: np.asarray(batch)})[0]))
+        elif callable(model):
+            try:
+                import torch
+
+                tensor = torch.as_tensor(np.asarray(batch))
+                with torch.inference_mode():
+                    output = model(tensor)
+                if hasattr(output, "detach"):
+                    output = output.detach().cpu().numpy()
+            except (ImportError, TypeError):
+                output = model(batch)
+            results.extend(_to_list(output))
         else:
             raise ValueError("Unsupported model type for batch inference")
     return results

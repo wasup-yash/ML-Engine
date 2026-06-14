@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, Iterator, List
 
 import numpy as np
 import onnxruntime
@@ -22,11 +22,28 @@ def _infer_single_frame(model: Any, frame: np.ndarray) -> Any:
     raise ValueError("Unsupported model type for video inference")
 
 
-def infer_sequence(model: Any, frames: List[np.ndarray], config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    predictions: List[Dict[str, Any]] = []
+def _normalize(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _normalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(item) for item in value]
+    if hasattr(value, "detach"):
+        return _normalize(value.detach().cpu().numpy())
+    return value
+
+
+def iter_sequence(
+    model: Any, frames: Iterable[np.ndarray], config: Dict[str, Any]
+) -> Iterator[Dict[str, Any]]:
+    del config
     for idx, frame in enumerate(frames):
         prediction = _infer_single_frame(model, frame)
-        if isinstance(prediction, np.ndarray):
-            prediction = prediction.tolist()
-        predictions.append({"frame_index": idx, "prediction": prediction})
-    return predictions
+        yield {"frame_index": idx, "prediction": _normalize(prediction)}
+
+
+def infer_sequence(model: Any, frames: List[np.ndarray], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return list(iter_sequence(model, frames, config))

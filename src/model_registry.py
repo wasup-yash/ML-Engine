@@ -44,12 +44,20 @@ class ModelRegistry:
                 first_name = next(iter(self.models.keys()))
                 return first_name, self.models[first_name]
 
-            sample = random.random()
+            available_split = {
+                name: weight
+                for name, weight in self.traffic_split.items()
+                if name in self.models and weight > 0
+            }
+            total = sum(available_split.values())
+            if total <= 0:
+                first_name = next(iter(self.models.keys()))
+                return first_name, self.models[first_name]
+
+            sample = random.random() * total
             cumulative = 0.0
             chosen_name = None
-            for name, weight in self.traffic_split.items():
-                if name not in self.models:
-                    continue
+            for name, weight in available_split.items():
                 cumulative += weight
                 if sample <= cumulative:
                     chosen_name = name

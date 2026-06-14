@@ -9,16 +9,22 @@ class AsyncBatcher:
         infer_fn: Callable[[List[Any]], Any],
         max_batch_size: int = 32,
         max_wait_ms: int = 20,
+        max_queue_size: int = 0,
     ) -> None:
         self.infer_fn = infer_fn
         self.max_batch_size = max(1, int(max_batch_size))
         self.max_wait_s = max(0.0, float(max_wait_ms) / 1000.0)
-        self._queue: "asyncio.Queue[Tuple[Any, asyncio.Future]]" = asyncio.Queue()
+        self._queue: "asyncio.Queue[Tuple[Any, asyncio.Future]]" = asyncio.Queue(
+            maxsize=max(0, int(max_queue_size))
+        )
         self._runner_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._closed = False
 
     async def start(self) -> None:
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("AsyncBatcher is closed")
             if self._runner_task is None or self._runner_task.done():
                 self._runner_task = asyncio.create_task(self._run(), name="async_batcher_runner")
 
@@ -28,6 +34,25 @@ class AsyncBatcher:
         future = loop.create_future()
         await self._queue.put((item, future))
         return await future
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._closed = True
+            task = self._runner_task
+            self._runner_task = None
+
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        while not self._queue.empty():
+            _, future = self._queue.get_nowait()
+            if not future.done():
+                future.set_exception(RuntimeError("AsyncBatcher closed before request completed"))
+            self._queue.task_done()
 
     async def _call_infer(self, batch_inputs: List[Any]) -> List[Any]:
         if inspect.iscoroutinefunction(self.infer_fn):
@@ -65,6 +90,15 @@ class AsyncBatcher:
             inputs = [request for request, _ in batch]
             futures = [future for _, future in batch]
 
+            active = [(item, future) for item, future in batch if not future.cancelled()]
+            if not active:
+                for _ in batch:
+                    self._queue.task_done()
+                continue
+
+            inputs = [request for request, _ in active]
+            futures = [future for _, future in active]
+
             try:
                 outputs = await self._call_infer(inputs)
                 if len(outputs) != len(batch):
@@ -78,3 +112,6 @@ class AsyncBatcher:
                 for future in futures:
                     if not future.done():
                         future.set_exception(e)
+            finally:
+                for _ in batch:
+                    self._queue.task_done()

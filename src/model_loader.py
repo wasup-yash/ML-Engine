@@ -4,9 +4,6 @@ from typing import Any, Optional
 
 import joblib
 import numpy as np
-import onnxruntime
-import tensorflow as tf
-import torch
 
 from src.logger import get_logger
 
@@ -21,16 +18,14 @@ def _is_diffusers_directory(model_path: str) -> bool:
     return os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "model_index.json"))
 
 
+def _is_huggingface_directory(model_path: str) -> bool:
+    return os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "config.json"))
+
+
 def validate_model(model: Any, input_sample: Optional[Any] = None) -> None:
     validation_errors = []
 
-    if isinstance(model, torch.nn.Module):
-        return
-
-    if isinstance(model, onnxruntime.InferenceSession):
-        return
-
-    if callable(model):
+    if callable(model) or hasattr(model, "run"):
         return
 
     if not hasattr(model, "predict"):
@@ -55,6 +50,8 @@ def _detect_format(model_path: str) -> str:
     if os.path.isdir(model_path):
         if os.path.exists(os.path.join(model_path, "saved_model.pb")):
             return "tensorflow"
+        if _is_huggingface_directory(model_path):
+            return "huggingface"
         return "auto"
 
     _, ext = os.path.splitext(model_path)
@@ -73,7 +70,28 @@ def _detect_format(model_path: str) -> str:
     return "auto"
 
 
-def _load_base_model(model_path: str, format: str) -> Any:
+def _load_huggingface_model(model_path: str, quantization: Optional[str]) -> Any:
+    from transformers import AutoModel, AutoModelForCausalLM
+
+    kwargs = {"local_files_only": True}
+    if quantization:
+        from transformers import BitsAndBytesConfig
+
+        kwargs["device_map"] = "auto"
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=quantization == "int8",
+            load_in_4bit=quantization == "int4",
+        )
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    except (ValueError, TypeError):
+        return AutoModel.from_pretrained(model_path, **kwargs)
+
+
+def _load_base_model(
+    model_path: str, format: str, quantization: Optional[str] = None
+) -> Any:
     if format == "auto":
         if _is_diffusers_directory(model_path):
             format = "diffusers"
@@ -92,6 +110,8 @@ def _load_base_model(model_path: str, format: str) -> Any:
                     return model
                 except Exception as pe:
                     logger.warning(f"Pickle loading failed: {str(pe)}, trying torch")
+                    import torch
+
                     return torch.load(model_path, map_location="cpu")
 
     if format == "diffusers":
@@ -99,16 +119,31 @@ def _load_base_model(model_path: str, format: str) -> Any:
 
         return DiffusionPipeline.from_pretrained(model_path)
 
+    if format == "huggingface":
+        return _load_huggingface_model(model_path, quantization)
+
     if format == "joblib":
         return joblib.load(model_path)
     if format == "pickle":
         with open(model_path, "rb") as f:
             return pickle.load(f)
     if format == "onnx":
-        return onnxruntime.InferenceSession(model_path)
+        import onnxruntime
+
+        available = onnxruntime.get_available_providers()
+        preferred = [
+            provider
+            for provider in ("CUDAExecutionProvider", "CPUExecutionProvider")
+            if provider in available
+        ]
+        return onnxruntime.InferenceSession(model_path, providers=preferred or available)
     if format == "torch":
+        import torch
+
         return torch.load(model_path, map_location="cpu")
     if format == "tensorflow":
+        import tensorflow as tf
+
         return tf.saved_model.load(model_path)
     raise ValueError(f"Unsupported model format: {format}")
 
@@ -120,6 +155,8 @@ def _apply_quantization(model: Any, quantization: Optional[str]) -> Any:
     quantization = quantization.lower()
     if quantization not in {"int8", "int4"}:
         raise ValueError("quantization must be one of: int8, int4, or null")
+
+    import torch
 
     if not isinstance(model, torch.nn.Module):
         logger.warning(
@@ -137,18 +174,10 @@ def _apply_quantization(model: Any, quantization: Optional[str]) -> Any:
             logger.warning(f"Failed to apply int8 quantization; using non-quantized model: {e}")
             return model
 
-    # int4 support is framework/model-specific; keep plumbing in place and attempt bitsandbytes-based prep
-    logger.info("int4 quantization requested")
-    try:
-        import bitsandbytes as bnb  # noqa: F401
-
-        logger.warning(
-            "bitsandbytes is installed, but generic in-place int4 wrapping is model-architecture specific. "
-            "Returning unmodified model. Use adapter-aware HF loading path for full int4 support."
-        )
-    except Exception:
-        logger.warning("bitsandbytes not available; cannot apply int4 quantization")
-    return model
+    raise ValueError(
+        "Generic torch INT4 conversion is unsupported. Load a Hugging Face directory with "
+        "model_format=huggingface so bitsandbytes quantization is applied during from_pretrained()."
+    )
 
 
 def load_model(
@@ -166,8 +195,9 @@ def load_model(
     logger.info(f"Loading model from {model_path} using {model_format} format")
 
     try:
-        model = _load_base_model(model_path, model_format)
-        model = _apply_quantization(model, quantization)
+        model = _load_base_model(model_path, model_format, quantization)
+        if model_format != "huggingface":
+            model = _apply_quantization(model, quantization)
 
         if adapter_path:
             from src.adapter_loader import load_adapter, merge_lora
@@ -178,7 +208,7 @@ def load_model(
                 logger.info("Merging adapter weights into base model")
                 model = merge_lora(model)
 
-        validate_model(model, input_sample=np.random.rand(1, 4))
+        validate_model(model)
         logger.info("Model loaded successfully")
         return model
     except Exception as e:

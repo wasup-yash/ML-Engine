@@ -20,12 +20,19 @@ DEFAULT_CONFIG = {
     "merge_adapter": False,
     "batch_max_wait_ms": 20,
     "batch_max_size": 32,
+    "batch_max_queue_size": 1024,
     "multimodal_model_path": None,
     "model_card_path": None,
+    "multimodal_trust_remote_code": False,
     "retrieval_index_path": None,
     "retrieval_top_k": 3,
     "retrieval_embedding_dim": 512,
+    "multimodal_max_image_bytes": 20971520,
     "video_stream_media_type": "application/jsonl",
+    "video_max_frames": 256,
+    "video_max_frame_bytes": 10485760,
+    "model_upload_max_bytes": 2147483648,
+    "adapter_upload_max_bytes": 4294967296,
     "benchmark_warmup_calls": 20,
     "benchmark_timed_calls": 100,
     "metrics_gpu_poll_interval_sec": 1.0,
@@ -62,6 +69,7 @@ def parse_args() -> Dict[str, Any]:
             "torch",
             "tensorflow",
             "diffusers",
+            "huggingface",
             "llava",
             "openvla",
             "clip",
@@ -90,6 +98,7 @@ def parse_args() -> Dict[str, Any]:
     parser.add_argument(
         "--merge_adapter",
         action="store_true",
+        default=None,
         help="Merge loaded LoRA adapter into the base model and unload adapter modules",
     )
     parser.add_argument(
@@ -102,12 +111,28 @@ def parse_args() -> Dict[str, Any]:
         type=int,
         help="Dynamic batching max batch size",
     )
+    parser.add_argument(
+        "--batch_max_queue_size",
+        type=int,
+        help="Maximum queued dynamic-batching requests; 0 means unbounded",
+    )
     parser.add_argument("--multimodal_model_path", type=str, help="Path or HF id for multimodal model")
     parser.add_argument("--model_card_path", type=str, help="Path to model card file for type detection")
+    parser.add_argument(
+        "--multimodal_trust_remote_code",
+        action="store_true",
+        default=None,
+        help="Allow execution of custom model repository code",
+    )
     parser.add_argument("--retrieval_index_path", type=str, help="Path to FAISS retrieval index")
     parser.add_argument("--retrieval_top_k", type=int, help="Top-k retrieval results to inject as context")
     parser.add_argument("--retrieval_embedding_dim", type=int, help="Embedding dimension for new FAISS index")
+    parser.add_argument("--multimodal_max_image_bytes", type=int, help="Maximum multimodal image upload size")
     parser.add_argument("--video_stream_media_type", type=str, help="Media type for /predict_video stream")
+    parser.add_argument("--video_max_frames", type=int, help="Maximum frames accepted by /predict_video")
+    parser.add_argument("--video_max_frame_bytes", type=int, help="Maximum decoded bytes per video frame")
+    parser.add_argument("--model_upload_max_bytes", type=int, help="Maximum uploaded model size")
+    parser.add_argument("--adapter_upload_max_bytes", type=int, help="Maximum uploaded adapter size")
     parser.add_argument("--benchmark_warmup_calls", type=int, help="Warmup call count for /benchmark")
     parser.add_argument("--benchmark_timed_calls", type=int, help="Timed call count for /benchmark")
     parser.add_argument(

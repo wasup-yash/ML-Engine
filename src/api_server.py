@@ -1,8 +1,11 @@
+import asyncio
 import base64
+import binascii
 import inspect
 import importlib.util
 import json
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -25,9 +28,6 @@ from src.logger import get_logger
 from src.metrics_collector import MetricsCollector
 from src.model_loader import load_model
 from src.model_registry import ModelRegistry
-from src.multimodal_loader import load_multimodal_model, run_multimodal_inference
-from src.retrieval_pipeline import RetrievalPipeline
-from src.video_pipeline import infer_sequence
 
 logger = get_logger(__name__)
 
@@ -63,25 +63,28 @@ class APIServer:
         self.model = model
         self.host = host
         self.port = port
-        self.config = config or get_config()
-        self.model_lock = threading.Lock()
+        self.config = config if config is not None else get_config()
+        self.model_lock = threading.RLock()
+        self._model_locks_guard = threading.Lock()
+        self._model_locks: Dict[int, threading.RLock] = {}
+        self._jobs_lock = threading.Lock()
+        self._background_tasks: set[asyncio.Task] = set()
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self.multimodal_bundle = None
         self.multimodal_lock = threading.Lock()
-        self.retrieval_pipeline: Optional[RetrievalPipeline] = None
+        self.retrieval_pipeline: Optional[Any] = None
         self.pre_hooks: List[Any] = []
         self.post_hooks: List[Any] = []
 
         self.metrics = MetricsCollector(
             poll_interval_sec=float(self.config.get("metrics_gpu_poll_interval_sec", 1.0))
         )
-        self.metrics.start_gpu_poller()
-
         self.model_registry = self._build_model_registry(model)
         self.infer_batcher = AsyncBatcher(
             infer_fn=self._infer_batch,
             max_batch_size=int(self.config.get("batch_max_size", 32)),
             max_wait_ms=int(self.config.get("batch_max_wait_ms", 20)),
+            max_queue_size=int(self.config.get("batch_max_queue_size", 1024)),
         )
 
         self.app = FastAPI(
@@ -93,6 +96,14 @@ class APIServer:
         self.plugins: List[Any] = []
         self._register_routes()
         self._load_plugins()
+        self.app.add_event_handler("startup", self.metrics.start_gpu_poller)
+        self.app.add_event_handler("shutdown", self._shutdown)
+
+    async def _shutdown(self) -> None:
+        await self.infer_batcher.close()
+        for task in list(self._background_tasks):
+            task.cancel()
+        self.metrics.stop_gpu_poller()
 
     def _build_model_registry(self, default_model: Any) -> ModelRegistry:
         registry = ModelRegistry(
@@ -162,8 +173,41 @@ class APIServer:
     def _route_model(self, request_context: Optional[Dict[str, Any]] = None) -> tuple[str, Any]:
         try:
             return self.model_registry.route(request_context)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Model routing failed; using default model: {e}")
             return "default", self.model
+
+    def _get_model_lock(self, model: Any) -> threading.RLock:
+        model_id = id(model)
+        with self._model_locks_guard:
+            return self._model_locks.setdefault(model_id, threading.RLock())
+
+    def _predict_locked(
+        self, model: Any, data: Union[List[List[float]], List[float], Dict[str, Any]]
+    ) -> Any:
+        with self._get_model_lock(model):
+            return self._predict_with_model(model, data)
+
+    def _schedule_background(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_shadow_prediction(
+        self,
+        endpoint: str,
+        primary_name: str,
+        data: Union[List[List[float]], List[float], Dict[str, Any]],
+    ) -> None:
+        shadow = self.model_registry.get_shadow()
+        if shadow is None or shadow[0] == primary_name:
+            return
+        shadow_name, shadow_model = shadow
+        try:
+            with self.metrics.track_inference(f"{endpoint}_shadow", shadow_name):
+                await asyncio.to_thread(self._predict_locked, shadow_model, data)
+        except Exception:
+            logger.exception(f"Shadow inference failed for model={shadow_name}")
 
     def _predict_with_model(self, model: Any, data: Union[List[List[float]], List[float], Dict[str, Any]]) -> Any:
         if isinstance(data, dict):
@@ -195,27 +239,50 @@ class APIServer:
             return {k: self._normalize_for_json(v) for k, v in value.items()}
         return value
 
-    def _infer_batch(self, batch_inputs: List[Any]) -> List[Any]:
-        model_name, model = self._route_model({"endpoint": "/infer"})
-        self.metrics.observe_batch_size("/infer", len(batch_inputs))
-        with self.metrics.track_inference("/infer", model_name):
-            with self.model_lock:
-                outputs = batch_inference(model, batch_inputs, batch_size=len(batch_inputs))
-        return self._normalize_for_json(outputs)
+    def _infer_batch(self, batch_requests: List[Any]) -> List[Any]:
+        results: List[Any] = [None] * len(batch_requests)
+        groups: Dict[int, Dict[str, Any]] = {}
+        for index, (model_name, model, item) in enumerate(batch_requests):
+            group = groups.setdefault(
+                id(model), {"name": model_name, "model": model, "items": [], "indices": []}
+            )
+            group["items"].append(item)
+            group["indices"].append(index)
+
+        for group in groups.values():
+            items = group["items"]
+            model = group["model"]
+            model_name = group["name"]
+            self.metrics.observe_batch_size("/infer", len(items))
+            with self.metrics.track_inference("/infer", model_name):
+                with self._get_model_lock(model):
+                    outputs = batch_inference(model, items, batch_size=len(items))
+            normalized = self._normalize_for_json(outputs)
+            if len(normalized) != len(items):
+                raise ValueError(
+                    f"Model {model_name} returned {len(normalized)} outputs for {len(items)} inputs"
+                )
+            for index, output in zip(group["indices"], normalized):
+                results[index] = output
+        return results
 
     def _get_multimodal_bundle(self):
         if self.multimodal_bundle is None:
             with self.multimodal_lock:
                 if self.multimodal_bundle is None:
+                    from src.multimodal_loader import load_multimodal_model
+
                     self.multimodal_bundle = load_multimodal_model(self.config)
         return self.multimodal_bundle
 
-    def _get_retrieval_pipeline(self) -> Optional[RetrievalPipeline]:
+    def _get_retrieval_pipeline(self) -> Optional[Any]:
         index_path = self.config.get("retrieval_index_path")
         if not index_path:
             return None
 
         if self.retrieval_pipeline is None:
+            from src.retrieval_pipeline import RetrievalPipeline
+
             bundle = self._get_multimodal_bundle()
             self.retrieval_pipeline = RetrievalPipeline(
                 index_path=index_path,
@@ -229,29 +296,105 @@ class APIServer:
         self, job_id: str, dataset: List[Dict[str, Any]], config_overrides: Dict[str, Any]
     ) -> None:
         try:
-            self.jobs[job_id]["status"] = "running"
+            with self._jobs_lock:
+                self.jobs[job_id]["status"] = "running"
             merged_config = self.config.copy()
             merged_config.update(config_overrides or {})
 
-            with self.model_lock:
+            with self._get_model_lock(self.model):
                 result = run_lora_finetune(self.model, dataset, merged_config)
+            with self.model_lock:
                 self.model = result["model"]
                 self.model_registry.add_model("default", self.model)
 
-            self.jobs[job_id]["status"] = "completed"
-            self.jobs[job_id]["adapter_path"] = result["adapter_path"]
+            with self._jobs_lock:
+                self.jobs[job_id]["status"] = "completed"
+                self.jobs[job_id]["adapter_path"] = result["adapter_path"]
         except Exception as e:
             logger.exception("Fine-tune job failed")
-            self.jobs[job_id]["status"] = "failed"
-            self.jobs[job_id]["error"] = str(e)
+            with self._jobs_lock:
+                self.jobs[job_id]["status"] = "failed"
+                self.jobs[job_id]["error"] = str(e)
 
     def _decode_frame(self, frame_b64: str) -> np.ndarray:
         payload = frame_b64
         if "," in frame_b64 and frame_b64.strip().startswith("data:"):
             payload = frame_b64.split(",", 1)[1]
-        frame_bytes = base64.b64decode(payload)
-        image = Image.open(BytesIO(frame_bytes)).convert("RGB")
+        frame_bytes = base64.b64decode(payload, validate=True)
+        max_bytes = int(self.config.get("video_max_frame_bytes", 10 * 1024 * 1024))
+        if len(frame_bytes) > max_bytes:
+            raise ValueError(f"Decoded frame exceeds video_max_frame_bytes={max_bytes}")
+        image = Image.open(BytesIO(frame_bytes))
+        image.load()
+        image = image.convert("RGB")
         return np.array(image)
+
+    async def _read_upload(self, file: UploadFile, max_bytes: int) -> bytes:
+        content = await file.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Upload exceeds {max_bytes} bytes")
+        return content
+
+    async def _stage_upload(
+        self,
+        file: UploadFile,
+        directory: str,
+        max_bytes: int,
+        prefix: str,
+        suffix: str = "",
+    ) -> str:
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+        total = 0
+        try:
+            with os.fdopen(fd, "wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise HTTPException(
+                            status_code=413, detail=f"Upload exceeds {max_bytes} bytes"
+                        )
+                    output.write(chunk)
+            return temporary_path
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            raise
+
+    def _load_uploaded_model(self, temporary_path: str) -> Any:
+        target_path = os.path.abspath(self.config["model_path"])
+        try:
+            loaded = load_model(
+                temporary_path,
+                self.config.get("model_format"),
+                quantization=self.config.get("quantization"),
+                adapter_path=self.config.get("adapter_path"),
+                merge_adapter=bool(self.config.get("merge_adapter", False)),
+            )
+            os.replace(temporary_path, target_path)
+            return loaded
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            raise
+
+    def _run_benchmark(
+        self,
+        model: Any,
+        data: Union[List[List[float]], List[float], Dict[str, Any]],
+        warmup_calls: int,
+        timed_calls: int,
+    ) -> List[float]:
+        with self._get_model_lock(model):
+            for _ in range(warmup_calls):
+                self._predict_with_model(model, data)
+
+            latencies: List[float] = []
+            for _ in range(timed_calls):
+                t0 = time.perf_counter()
+                self._predict_with_model(model, data)
+                latencies.append(time.perf_counter() - t0)
+        return latencies
 
     def _retrieved_context(self, retrieved_items: List[Dict[str, Any]]) -> str:
         lines: List[str] = []
@@ -305,8 +448,10 @@ class APIServer:
                 self.metrics.observe_batch_size("/predict", self._sample_count(data))
 
                 with self.metrics.track_inference("/predict", model_name):
-                    with self.model_lock:
-                        result = self._predict_with_model(model, data)
+                    result = await asyncio.to_thread(self._predict_locked, model, data)
+                self._schedule_background(
+                    self._run_shadow_prediction("/predict", model_name, data)
+                )
                 result = self._normalize_for_json(result)
                 return {"prediction": result}
             except Exception as e:
@@ -319,12 +464,15 @@ class APIServer:
                 if len(inputs) == 0:
                     return {"results": []}
 
-                if isinstance(inputs[0], list):
-                    # Request provided a local batch; route each sample through the shared dynamic batcher.
-                    results = [await self.infer_batcher.submit(sample) for sample in inputs]  # type: ignore[index]
-                else:
-                    result = await self.infer_batcher.submit(inputs)
-                    results = [result]
+                samples = inputs if isinstance(inputs[0], list) else [inputs]
+                submissions = []
+                for sample in samples:
+                    model_name, model = self._route_model({"endpoint": "/infer"})
+                    submissions.append(self.infer_batcher.submit((model_name, model, sample)))
+                    self._schedule_background(
+                        self._run_shadow_prediction("/infer", model_name, sample)
+                    )
+                results = await asyncio.gather(*submissions)
                 return {"results": self._normalize_for_json(results)}
             except Exception as e:
                 logger.error(f"Inference error: {str(e)}")
@@ -345,37 +493,55 @@ class APIServer:
 
                 pil_image = None
                 if image is not None:
-                    pil_image = Image.open(BytesIO(await image.read())).convert("RGB")
+                    image_bytes = await self._read_upload(
+                        image,
+                        int(self.config.get("multimodal_max_image_bytes", 20 * 1024 * 1024)),
+                    )
+                    pil_image = Image.open(BytesIO(image_bytes))
+                    pil_image.load()
+                    pil_image = pil_image.convert("RGB")
 
-                bundle = self._get_multimodal_bundle()
-                retrieval = self._get_retrieval_pipeline()
+                bundle = await asyncio.to_thread(self._get_multimodal_bundle)
+                retrieval = await asyncio.to_thread(self._get_retrieval_pipeline)
                 retrieved_items: List[Dict[str, Any]] = []
                 retrieved_context = ""
 
                 if retrieval is not None:
                     query = pil_image if pil_image is not None else text
-                    retrieved_items = retrieval.retrieve(
-                        query=query,
-                        top_k=int(self.config.get("retrieval_top_k", 3)),
+                    retrieved_items = await asyncio.to_thread(
+                        retrieval.retrieve,
+                        query,
+                        int(self.config.get("retrieval_top_k", 3)),
                     )
                     retrieved_context = self._retrieved_context(retrieved_items)
 
                 with self.metrics.track_inference("/predict_multimodal", str(bundle.model_type)):
-                    result = run_multimodal_inference(
-                        bundle=bundle,
-                        text=text,
-                        image=pil_image,
-                        retrieved_context=retrieved_context,
-                        max_new_tokens=int(request_payload.get("max_new_tokens", 128)),
+                    from src.multimodal_loader import run_multimodal_inference
+
+                    result = await asyncio.to_thread(
+                        run_multimodal_inference,
+                        bundle,
+                        text,
+                        pil_image,
+                        retrieved_context,
+                        int(request_payload.get("max_new_tokens", 128)),
                     )
 
                 if retrieval is not None:
-                    retrieval.add(text, metadata={"text": text, "type": "text"})
+                    await asyncio.to_thread(
+                        retrieval.add, text, {"text": text, "type": "text"}
+                    )
                     if pil_image is not None:
-                        retrieval.add(pil_image, metadata={"type": "image", "text": text})
-                    retrieval.save()
+                        await asyncio.to_thread(
+                            retrieval.add, pil_image, {"type": "image", "text": text}
+                        )
+                    await asyncio.to_thread(retrieval.save)
 
                 return {"prediction": result, "retrieved_context": retrieved_items}
+            except HTTPException:
+                raise
+            except (ValueError, json.JSONDecodeError) as e:
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 logger.error(f"Multimodal prediction error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Multimodal prediction error: {str(e)}")
@@ -383,20 +549,34 @@ class APIServer:
         @self.app.post("/predict_video")
         async def predict_video(request: VideoPredictionRequest) -> StreamingResponse:
             try:
-                frames = [self._decode_frame(frame_b64) for frame_b64 in request.frames]
+                max_frames = int(self.config.get("video_max_frames", 256))
+                if not request.frames:
+                    raise ValueError("frames must not be empty")
+                if len(request.frames) > max_frames:
+                    raise ValueError(f"frames exceeds video_max_frames={max_frames}")
+                frames = await asyncio.to_thread(
+                    lambda: [self._decode_frame(frame_b64) for frame_b64 in request.frames]
+                )
                 model_name, model = self._route_model({"endpoint": "/predict_video"})
                 self.metrics.observe_batch_size("/predict_video", len(frames))
 
-                with self.metrics.track_inference("/predict_video", model_name):
-                    with self.model_lock:
-                        results = infer_sequence(model, frames, self.config)
+                def stream():
+                    from src.video_pipeline import iter_sequence
 
-                async def stream():
-                    for row in results:
-                        yield (json.dumps(row) + "\n").encode("utf-8")
+                    with self.metrics.track_inference("/predict_video", model_name):
+                        iterator = iter_sequence(model, frames, self.config)
+                        while True:
+                            try:
+                                with self._get_model_lock(model):
+                                    row = next(iterator)
+                            except StopIteration:
+                                break
+                            yield (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
 
                 media_type = self.config.get("video_stream_media_type", "application/jsonl")
                 return StreamingResponse(stream(), media_type=media_type)
+            except (ValueError, binascii.Error) as e:
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 logger.error(f"Video prediction error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Video prediction error: {str(e)}")
@@ -411,23 +591,19 @@ class APIServer:
             try:
                 warmup_calls = int(self.config.get("benchmark_warmup_calls", 20))
                 timed_calls = int(self.config.get("benchmark_timed_calls", 100))
+                if warmup_calls < 0 or timed_calls < 1:
+                    raise ValueError("benchmark_warmup_calls must be >= 0 and timed_calls must be >= 1")
                 data = input_data.data
                 model_name, model = self._route_model({"endpoint": "/benchmark"})
                 self.metrics.observe_batch_size("/benchmark", self._sample_count(data))
 
-                with self.model_lock:
-                    for _ in range(warmup_calls):
-                        self._predict_with_model(model, data)
-
-                    latencies: List[float] = []
-                    for _ in range(timed_calls):
-                        t0 = time.perf_counter()
-                        with self.metrics.track_inference("/benchmark", model_name):
-                            self._predict_with_model(model, data)
-                        latencies.append(time.perf_counter() - t0)
-
-                if not latencies:
-                    raise ValueError("No latency samples recorded")
+                latencies = await asyncio.to_thread(
+                    self._run_benchmark, model, data, warmup_calls, timed_calls
+                )
+                for latency in latencies:
+                    self.metrics.inference_latency_seconds.labels(
+                        endpoint="/benchmark", model=model_name
+                    ).observe(latency)
 
                 p50 = float(np.percentile(latencies, 50))
                 p95 = float(np.percentile(latencies, 95))
@@ -441,6 +617,8 @@ class APIServer:
                     "latency_seconds": {"p50": p50, "p95": p95, "p99": p99},
                     "throughput_rps": throughput,
                 }
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 logger.error(f"Benchmark error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Benchmark error: {str(e)}")
@@ -448,17 +626,17 @@ class APIServer:
         @self.app.post("/upload_model")
         async def upload_model(file: UploadFile) -> Dict[str, str]:
             try:
-                with open(self.config["model_path"], "wb") as f:
-                    f.write(await file.read())
-
+                target_path = os.path.abspath(self.config["model_path"])
+                temporary_path = await self._stage_upload(
+                    file=file,
+                    directory=os.path.dirname(target_path) or ".",
+                    max_bytes=int(self.config.get("model_upload_max_bytes", 2 * 1024**3)),
+                    prefix="model-upload-",
+                    suffix=os.path.splitext(target_path)[1],
+                )
+                loaded_model = await asyncio.to_thread(self._load_uploaded_model, temporary_path)
                 with self.model_lock:
-                    self.model = load_model(
-                        self.config["model_path"],
-                        self.config.get("model_format"),
-                        quantization=self.config.get("quantization"),
-                        adapter_path=self.config.get("adapter_path"),
-                        merge_adapter=bool(self.config.get("merge_adapter", False)),
-                    )
+                    self.model = loaded_model
                     self.model_registry.add_model("default", self.model)
                 logger.info("Model reloaded successfully")
                 return {"message": "Model reloaded successfully"}
@@ -469,7 +647,10 @@ class APIServer:
         @self.app.post("/finetune")
         async def finetune(request: FineTuneRequest) -> Dict[str, str]:
             job_id = str(uuid.uuid4())
-            self.jobs[job_id] = {"status": "queued"}
+            with self._jobs_lock:
+                if any(job.get("status") in {"queued", "running"} for job in self.jobs.values()):
+                    raise HTTPException(status_code=409, detail="A fine-tune job is already active")
+                self.jobs[job_id] = {"status": "queued"}
 
             worker = threading.Thread(
                 target=self._run_finetune_job,
@@ -481,9 +662,10 @@ class APIServer:
 
         @self.app.get("/finetune/{job_id}")
         async def finetune_status(job_id: str) -> Dict[str, Any]:
-            if job_id not in self.jobs:
-                raise HTTPException(status_code=404, detail="Job ID not found")
-            return self.jobs[job_id]
+            with self._jobs_lock:
+                if job_id not in self.jobs:
+                    raise HTTPException(status_code=404, detail="Job ID not found")
+                return dict(self.jobs[job_id])
 
         @self.app.post("/load_adapter")
         async def load_adapter_endpoint(
@@ -496,18 +678,32 @@ class APIServer:
                 if file is not None:
                     save_root = self.config.get("adapter_upload_dir", "./uploaded_adapters")
                     os.makedirs(save_root, exist_ok=True)
-                    save_path = os.path.join(save_root, file.filename)
-                    with open(save_path, "wb") as f:
-                        f.write(await file.read())
+                    safe_name = os.path.basename(file.filename or "adapter.safetensors")
+                    save_path = os.path.join(save_root, safe_name)
+                    temp_path = await self._stage_upload(
+                        file=file,
+                        directory=save_root,
+                        max_bytes=int(self.config.get("adapter_upload_max_bytes", 4 * 1024**3)),
+                        prefix="adapter-upload-",
+                    )
+                    try:
+                        os.replace(temp_path, save_path)
+                    except Exception:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                        raise
                     resolved_path = save_path
 
                 if not resolved_path:
                     raise ValueError("Provide either adapter_path or file upload")
 
-                with self.model_lock:
-                    self.model = load_adapter(self.model, resolved_path)
+                current_model = self.model
+                with self._get_model_lock(current_model):
+                    updated_model = load_adapter(current_model, resolved_path)
                     if merge:
-                        self.model = merge_lora(self.model)
+                        updated_model = merge_lora(updated_model)
+                with self.model_lock:
+                    self.model = updated_model
                     self.model_registry.add_model("default", self.model)
 
                 self.config["adapter_path"] = resolved_path
