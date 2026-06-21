@@ -8,12 +8,6 @@ _LOG_LEVEL = logging.INFO
 _LOGGERS = {}
 
 def configure_logging(level: Optional[str] = None):
-    """
-    Configure the global logging settings.
-    
-    Args:
-        level: Logging level (e.g., "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-    """
     global _LOG_LEVEL
     
     if level:

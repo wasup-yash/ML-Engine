@@ -12,14 +12,14 @@ from src.logger import get_logger
 logger = get_logger(__name__)
 
 try:
-    from transformers import AutoModelForVision2Seq  # type: ignore
+    from transformers import AutoModelForVision2Seq  
 except Exception:
-    AutoModelForVision2Seq = None  # type: ignore
+    AutoModelForVision2Seq = None
 
 try:
-    from transformers import AutoModelForImageTextToText  # type: ignore
+    from transformers import AutoModelForImageTextToText  
 except Exception:
-    AutoModelForImageTextToText = None  # type: ignore
+    AutoModelForImageTextToText = None  
 
 
 @dataclass
