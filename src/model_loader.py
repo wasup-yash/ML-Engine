@@ -6,12 +6,16 @@ import joblib
 import numpy as np
 
 from src.logger import get_logger
+from src.security import is_trusted_path
 
 logger = get_logger(__name__)
 
 
 class ModelValidationError(Exception):
     pass
+
+
+UNSAFE_DESERIALIZATION_FORMATS = frozenset({"joblib", "pickle", "torch", "auto"})
 
 
 def _is_diffusers_directory(model_path: str) -> bool:
@@ -48,8 +52,6 @@ def _detect_format(model_path: str) -> str:
         return "diffusers"
 
     if os.path.isdir(model_path):
-        if os.path.exists(os.path.join(model_path, "saved_model.pb")):
-            return "tensorflow"
         if _is_huggingface_directory(model_path):
             return "huggingface"
         return "auto"
@@ -64,8 +66,6 @@ def _detect_format(model_path: str) -> str:
         return "onnx"
     if ext in [".pt", ".pth"]:
         return "torch"
-    if ext in [".pb", ".savedmodel"]:
-        return "tensorflow"
     logger.warning(f"Could not auto-detect model format from extension: {ext}")
     return "auto"
 
@@ -141,10 +141,6 @@ def _load_base_model(
         import torch
 
         return torch.load(model_path, map_location="cpu")
-    if format == "tensorflow":
-        import tensorflow as tf
-
-        return tf.saved_model.load(model_path)
     raise ValueError(f"Unsupported model format: {format}")
 
 
@@ -186,12 +182,27 @@ def load_model(
     quantization: Optional[str] = None,
     adapter_path: Optional[str] = None,
     merge_adapter: bool = False,
+    trusted_model_paths: Optional[list[str]] = None,
+    allow_unsafe_deserialization: bool = False,
+    storage: Any = None,
 ) -> Any:
+    if storage is not None:
+        model_path = storage.materialize(model_path)
     if not os.path.exists(model_path):
         logger.error(f"Model file not found: {model_path}")
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     model_format = (format or _detect_format(model_path)).lower()
+    if model_format in UNSAFE_DESERIALIZATION_FORMATS:
+        if not allow_unsafe_deserialization:
+            raise PermissionError(
+                f"Refusing unsafe {model_format} deserialization. Configure an explicit trusted "
+                "model path and set allow_unsafe_deserialization only for artifacts you control."
+            )
+        if not is_trusted_path(model_path, trusted_model_paths or []):
+            raise PermissionError(
+                f"Model path is not in trusted_model_paths: {model_path}"
+            )
     logger.info(f"Loading model from {model_path} using {model_format} format")
 
     try:

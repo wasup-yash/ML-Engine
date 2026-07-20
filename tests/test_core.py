@@ -1,6 +1,9 @@
 import asyncio
 import base64
+import importlib
 import json
+import os
+import hashlib
 import tempfile
 import unittest
 from io import BytesIO
@@ -11,11 +14,14 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from src.api_server import APIServer
-from src.config_manager import DEFAULT_CONFIG
+from src.config_manager import DEFAULT_CONFIG, validate_config
 from src.dynamic_batcher import AsyncBatcher
 from src.model_loader import validate_model
 from src.model_registry import ModelRegistry
 from src.retrieval_pipeline import RetrievalPipeline
+from src.security import validate_safetensors_file
+from src.state_store import SQLiteJobStore
+from src.storage import LocalArtifactStorage
 
 
 class RecordingModel:
@@ -31,6 +37,28 @@ class RecordingModel:
 
 
 class CoreTests(unittest.TestCase):
+    def test_yaml_model_format_validation_matches_cli_choices(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported model_format"):
+            validate_config({"model_format": "not-a-real-format"})
+        validate_config({"model_format": "joblib"})
+
+    def test_model_zoo_has_no_import_time_download(self):
+        module = importlib.import_module("src.model_zoo")
+        self.assertTrue(hasattr(module, "ModelZoo"))
+
+    def test_phase_zero_artifacts_are_not_present(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        self.assertFalse(os.path.exists(os.path.join(root, "model.joblib")))
+        self.assertFalse(os.path.exists(os.path.join(root, "tmp_test_write.txt")))
+
+    def test_dockerfile_starts_server_and_has_healthcheck(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(root, "DOCKERFILE"), encoding="utf-8") as file:
+            dockerfile = file.read()
+        self.assertIn('CMD ["python", "run_engine.py"', dockerfile)
+        self.assertIn("HEALTHCHECK", dockerfile)
+        self.assertIn("USER mlengine", dockerfile)
+
     def test_model_validation_does_not_run_arbitrary_prediction(self):
         class Model:
             def predict(self, _):
@@ -84,6 +112,7 @@ class CoreTests(unittest.TestCase):
         config = DEFAULT_CONFIG.copy()
         config.update(
             {
+                "auth_required": False,
                 "plugin_dir": "missing-test-plugins",
                 "batch_max_wait_ms": 5,
                 "benchmark_warmup_calls": 1,
@@ -107,6 +136,85 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             rows = [json.loads(line) for line in response.text.strip().splitlines()]
             self.assertEqual([row["frame_index"] for row in rows], [0, 1])
+
+    def test_authentication_scopes_and_health_exemption(self):
+        api_key = "predict-secret"
+        key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        config = DEFAULT_CONFIG.copy()
+        config.update(
+            {
+                "plugin_dir": "missing-test-plugins",
+                "auth_required": True,
+                "api_key_hashes_env": "TEST_API_KEY_HASHES",
+            }
+        )
+        old_value = os.environ.get("TEST_API_KEY_HASHES")
+        os.environ["TEST_API_KEY_HASHES"] = json.dumps(
+            {key_hash: {"key_id": "predictor", "tenant_id": "tenant-a", "scopes": ["predict"]}}
+        )
+        try:
+            with TestClient(APIServer(RecordingModel(), config=config).app) as client:
+                self.assertEqual(client.get("/health").status_code, 200)
+                self.assertEqual(client.post("/predict", json={"data": [1.0, 2.0]}).status_code, 401)
+                self.assertEqual(
+                    client.post(
+                        "/predict",
+                        json={"data": [1.0, 2.0]},
+                        headers={"X-API-Key": api_key},
+                    ).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    client.post(
+                        "/finetune",
+                        json={"dataset": [{"text": "a", "label": "b"}]},
+                        headers={"X-API-Key": api_key},
+                    ).status_code,
+                    403,
+                )
+        finally:
+            if old_value is None:
+                os.environ.pop("TEST_API_KEY_HASHES", None)
+            else:
+                os.environ["TEST_API_KEY_HASHES"] = old_value
+
+    def test_safetensors_header_validation(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as file:
+            path = file.name
+            header = json.dumps(
+                {"tensor": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+            ).encode("utf-8")
+            file.write(len(header).to_bytes(8, "little"))
+            file.write(header)
+            file.write(b"\x00\x00\x00\x00")
+        try:
+            validate_safetensors_file(path)
+        finally:
+            os.unlink(path)
+
+    def test_sqlite_job_state_survives_store_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "jobs.sqlite3")
+            first = SQLiteJobStore(path)
+            first.create("job-1", "tenant-a", {"dataset_size": 2})
+            first.update("job-1", "running")
+            first.close()
+
+            second = SQLiteJobStore(path)
+            job = second.get("job-1", "tenant-a")
+            self.assertEqual(job["status"], "running")
+            self.assertEqual(job["payload"], {"dataset_size": 2})
+            second.close()
+
+    def test_local_storage_rejects_path_escape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = os.path.join(directory, "artifact.onnx")
+            with open(artifact, "wb") as file:
+                file.write(b"test")
+            storage = LocalArtifactStorage(directory)
+            self.assertEqual(storage.materialize("artifact.onnx"), artifact)
+            with self.assertRaises(PermissionError):
+                storage.materialize("../outside.onnx")
 
 
 if __name__ == "__main__":

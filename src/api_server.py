@@ -14,8 +14,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,15 @@ from src.logger import get_logger
 from src.metrics_collector import MetricsCollector
 from src.model_loader import load_model
 from src.model_registry import ModelRegistry
+from src.security import (
+    APIKeyAuthenticator,
+    AuthenticationError,
+    AuthorizationError,
+    FixedWindowRateLimiter,
+    validate_safetensors_file,
+)
+from src.state_store import SQLiteJobStore
+from src.storage import create_artifact_storage
 
 logger = get_logger(__name__)
 
@@ -69,12 +79,17 @@ class APIServer:
         self._model_locks: Dict[int, threading.RLock] = {}
         self._jobs_lock = threading.Lock()
         self._background_tasks: set[asyncio.Task] = set()
-        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.job_store = SQLiteJobStore(str(self.config.get("job_store_path")))
+        self.storage = create_artifact_storage(self.config)
         self.multimodal_bundle = None
         self.multimodal_lock = threading.Lock()
         self.retrieval_pipeline: Optional[Any] = None
         self.pre_hooks: List[Any] = []
         self.post_hooks: List[Any] = []
+        self.authenticator = APIKeyAuthenticator(self.config)
+        self.rate_limiter = FixedWindowRateLimiter(
+            int(self.config.get("rate_limit_requests_per_minute", 600))
+        )
 
         self.metrics = MetricsCollector(
             poll_interval_sec=float(self.config.get("metrics_gpu_poll_interval_sec", 1.0))
@@ -92,6 +107,13 @@ class APIServer:
             description="API for serving machine learning model predictions",
             version="0.5.0",
         )
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(self.config.get("cors_allowed_origins", [])),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+        )
 
         self.plugins: List[Any] = []
         self._register_routes()
@@ -107,10 +129,11 @@ class APIServer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.metrics.stop_gpu_poller()
+        self.job_store.close()
 
     def _build_model_registry(self, default_model: Any) -> ModelRegistry:
         registry = ModelRegistry(
-            models={"default": default_model},
+            models={"default": default_model} if default_model is not None else {},
             traffic_split=self.config.get("traffic_split", {}),
             shadow_model=self.config.get("shadow_model"),
         )
@@ -131,6 +154,11 @@ class APIServer:
                     quantization=slot_config.get("quantization", self.config.get("quantization")),
                     adapter_path=slot_config.get("adapter_path", self.config.get("adapter_path")),
                     merge_adapter=bool(slot_config.get("merge_adapter", False)),
+                    trusted_model_paths=self.config.get("trusted_model_paths", []),
+                    allow_unsafe_deserialization=bool(
+                        self.config.get("allow_unsafe_deserialization", False)
+                    ),
+                    storage=self.storage,
                 )
                 registry.add_model(slot_name, loaded)
                 logger.info(f"Loaded model variant slot={slot_name}")
@@ -174,6 +202,8 @@ class APIServer:
         logger.warning(f"Unsupported hook_type={hook_type}; hook ignored")
 
     def _route_model(self, request_context: Optional[Dict[str, Any]] = None) -> tuple[str, Any]:
+        if self.model is None and not self.model_registry.models:
+            raise HTTPException(status_code=503, detail="No model is loaded")
         try:
             return self.model_registry.route(request_context)
         except Exception as e:
@@ -299,8 +329,7 @@ class APIServer:
         self, job_id: str, dataset: List[Dict[str, Any]], config_overrides: Dict[str, Any]
     ) -> None:
         try:
-            with self._jobs_lock:
-                self.jobs[job_id]["status"] = "running"
+            self.job_store.update(job_id, "running")
             merged_config = self.config.copy()
             merged_config.update(config_overrides or {})
 
@@ -310,14 +339,12 @@ class APIServer:
                 self.model = result["model"]
                 self.model_registry.add_model("default", self.model)
 
-            with self._jobs_lock:
-                self.jobs[job_id]["status"] = "completed"
-                self.jobs[job_id]["adapter_path"] = result["adapter_path"]
+            self.job_store.update(
+                job_id, "completed", {"adapter_path": result["adapter_path"]}
+            )
         except Exception as e:
             logger.exception("Fine-tune job failed")
-            with self._jobs_lock:
-                self.jobs[job_id]["status"] = "failed"
-                self.jobs[job_id]["error"] = str(e)
+            self.job_store.update(job_id, "failed", {"error": str(e)})
 
     def _decode_frame(self, frame_b64: str) -> np.ndarray:
         payload = frame_b64
@@ -373,6 +400,9 @@ class APIServer:
                 quantization=self.config.get("quantization"),
                 adapter_path=self.config.get("adapter_path"),
                 merge_adapter=bool(self.config.get("merge_adapter", False)),
+                trusted_model_paths=self.config.get("trusted_model_paths", []),
+                allow_unsafe_deserialization=False,
+                storage=None,
             )
             os.replace(temporary_path, target_path)
             return loaded
@@ -416,6 +446,23 @@ class APIServer:
     def _register_routes(self) -> None:
         @self.app.middleware("http")
         async def _hook_middleware(request, call_next):
+            if request.method != "OPTIONS" and request.url.path != "/health":
+                required_scope = (
+                    "admin"
+                    if request.url.path in {"/upload_model", "/load_adapter", "/finetune"}
+                    else "predict"
+                )
+                try:
+                    principal = self.authenticator.authenticate(request.headers.get("X-API-Key"))
+                    self.authenticator.require_scope(principal, required_scope)
+                    if not self.rate_limiter.check(principal.key_id):
+                        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+                    request.state.principal = principal
+                except AuthenticationError as exc:
+                    return JSONResponse(status_code=401, content={"detail": str(exc)})
+                except AuthorizationError as exc:
+                    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
             for hook in self.pre_hooks:
                 try:
                     maybe = hook(request)
@@ -433,6 +480,10 @@ class APIServer:
                         await maybe
                 except Exception:
                     logger.exception("Post-hook failed")
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Cache-Control"] = "no-store"
             return response
 
         @self.app.get("/")
@@ -441,7 +492,11 @@ class APIServer:
 
         @self.app.get("/health")
         def health() -> Dict[str, str]:
-            return {"status": "ok"}
+            return {
+                "status": "ok",
+                "model_loaded": str(bool(self.model_registry.models)).lower(),
+                "job_queue_depth": str(self.job_store.active_count()),
+            }
 
         @self.app.post("/predict", response_model=PredictionResponse)
         async def predict(input_data: PredictionInput) -> Dict[str, Any]:
@@ -629,6 +684,14 @@ class APIServer:
         @self.app.post("/upload_model")
         async def upload_model(file: UploadFile) -> Dict[str, str]:
             try:
+                model_format = (self.config.get("model_format") or "").lower()
+                if model_format != "onnx":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Untrusted model uploads only support explicit onnx format",
+                    )
+                if not (file.filename or "").lower().endswith(".onnx"):
+                    raise HTTPException(status_code=400, detail="Model upload must be an .onnx file")
                 target_path = os.path.abspath(self.config["model_path"])
                 temporary_path = await self._stage_upload(
                     file=file,
@@ -643,17 +706,19 @@ class APIServer:
                     self.model_registry.add_model("default", self.model)
                 logger.info("Model reloaded successfully")
                 return {"message": "Model reloaded successfully"}
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Model upload error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Model upload error: {str(e)}")
 
         @self.app.post("/finetune")
-        async def finetune(request: FineTuneRequest) -> Dict[str, str]:
+        async def finetune(request: FineTuneRequest, http_request: Request) -> Dict[str, str]:
             job_id = str(uuid.uuid4())
-            with self._jobs_lock:
-                if any(job.get("status") in {"queued", "running"} for job in self.jobs.values()):
-                    raise HTTPException(status_code=409, detail="A fine-tune job is already active")
-                self.jobs[job_id] = {"status": "queued"}
+            tenant_id = http_request.state.principal.tenant_id
+            if self.job_store.active_count(tenant_id) > 0:
+                raise HTTPException(status_code=409, detail="A fine-tune job is already active")
+            self.job_store.create(job_id, tenant_id, {"dataset_size": len(request.dataset)})
 
             worker = threading.Thread(
                 target=self._run_finetune_job,
@@ -664,11 +729,11 @@ class APIServer:
             return {"job_id": job_id, "status": "queued"}
 
         @self.app.get("/finetune/{job_id}")
-        async def finetune_status(job_id: str) -> Dict[str, Any]:
-            with self._jobs_lock:
-                if job_id not in self.jobs:
-                    raise HTTPException(status_code=404, detail="Job ID not found")
-                return dict(self.jobs[job_id])
+        async def finetune_status(job_id: str, http_request: Request) -> Dict[str, Any]:
+            try:
+                return self.job_store.get(job_id, http_request.state.principal.tenant_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Job ID not found")
 
         @self.app.post("/load_adapter")
         async def load_adapter_endpoint(
@@ -681,15 +746,23 @@ class APIServer:
                 if file is not None:
                     save_root = self.config.get("adapter_upload_dir", "./uploaded_adapters")
                     os.makedirs(save_root, exist_ok=True)
-                    safe_name = os.path.basename(file.filename or "adapter.safetensors")
+                    supplied_name = file.filename or ""
+                    safe_name = os.path.basename(supplied_name)
+                    if not safe_name or safe_name != supplied_name or not safe_name.endswith(".safetensors"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Adapter upload must be a flat .safetensors filename",
+                        )
                     save_path = os.path.join(save_root, safe_name)
                     temp_path = await self._stage_upload(
                         file=file,
                         directory=save_root,
                         max_bytes=int(self.config.get("adapter_upload_max_bytes", 4 * 1024**3)),
                         prefix="adapter-upload-",
+                        suffix=".safetensors",
                     )
                     try:
+                        validate_safetensors_file(temp_path)
                         os.replace(temp_path, save_path)
                     except Exception:
                         if os.path.exists(temp_path):
@@ -699,6 +772,8 @@ class APIServer:
 
                 if not resolved_path:
                     raise ValueError("Provide either adapter_path or file upload")
+                if not str(resolved_path).endswith(".safetensors") and not os.path.isdir(resolved_path):
+                    raise ValueError("Adapter path must be a safetensors file or adapter directory")
 
                 current_model = self.model
                 with self._get_model_lock(current_model):
@@ -712,6 +787,8 @@ class APIServer:
                 self.config["adapter_path"] = resolved_path
                 self.config["merge_adapter"] = merge
                 return {"message": "Adapter loaded successfully", "adapter_path": resolved_path}
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Adapter load error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Adapter load error: {str(e)}")

@@ -25,5 +25,6 @@ class ModelZoo:
      
         raise NotImplementedError("TensorFlow Hub download not yet implemented")
 
-model_path = ModelZoo.download("bert-base-uncased", framework="huggingface")
-print(f"Model downloaded to: {model_path}")
+if __name__ == "__main__":
+    model_path = ModelZoo.download("bert-base-uncased", framework="huggingface")
+    print(f"Model downloaded to: {model_path}")

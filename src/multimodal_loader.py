@@ -108,7 +108,20 @@ def load_multimodal_model(config: Dict[str, Any]) -> MultimodalBundle:
 
     model_type = detect_model_type(config)
     logger.info(f"Loading multimodal model {model_path} as type={model_type}")
-    trust_remote_code = bool(config.get("multimodal_trust_remote_code", False))
+    if config.get("multimodal_trust_remote_code", False):
+        raise ValueError(
+            "multimodal_trust_remote_code is no longer global; configure "
+            "trusted_remote_code_models for the specific model path"
+        )
+    trust_remote_code = bool(
+        config.get("trusted_remote_code_models", {}).get(model_path, False)
+    )
+    if trust_remote_code:
+        logger.warning(
+            "audit_event=trust_remote_code_enabled model_path=%s model_type=%s",
+            model_path,
+            model_type,
+        )
 
     processor = AutoProcessor.from_pretrained(
         model_path, trust_remote_code=trust_remote_code

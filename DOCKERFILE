@@ -1,15 +1,33 @@
-# Use a base image with Python
-FROM python:3.13-slim
+FROM python:3.13-slim AS builder
 
-# Set the working directory in the container
+ENV VIRTUAL_ENV=/opt/venv
+RUN python -m venv ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip==25.1.1 \
+    && pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.13-slim AS runtime
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN groupadd --gid 10001 mlengine \
+    && useradd --uid 10001 --gid mlengine --create-home --shell /usr/sbin/nologin mlengine
+
 WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=mlengine:mlengine src ./src
+COPY --chown=mlengine:mlengine config ./config
+COPY --chown=mlengine:mlengine run_engine.py ./
 
-# Copy the necessary files into the container
-COPY requirement.txt requirement.txt
-COPY create_sample_model.py create_sample_model.py
+USER mlengine
+EXPOSE 5000
 
-# Install the required Python libraries
-RUN pip install -r requirement.txt
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/health', timeout=3).read()"]
 
-# Run the Python script when the container starts
-CMD ["python", "create_sample_model.py"]
+CMD ["python", "run_engine.py", "--config", "config/default_config.yaml", "--allow_empty_model"]

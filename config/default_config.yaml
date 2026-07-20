@@ -1,5 +1,17 @@
 model_path: "./model.joblib"   
 model_format: null             
+allow_empty_model: false
+auth_required: true
+api_key_hashes_env: "ML_ENGINE_API_KEY_HASHES"
+rate_limit_requests_per_minute: 600
+cors_allowed_origins: []
+trusted_model_paths: []
+allow_unsafe_deserialization: false
+trusted_remote_code_models: {}
+job_store_backend: "sqlite"
+job_store_path: "./data/ml-engine-jobs.sqlite3"
+artifact_storage_backend: "local"
+artifact_storage_root: "."
 quantization: null
 adapter_path: null
 merge_adapter: false
@@ -8,7 +20,6 @@ batch_max_size: 32
 batch_max_queue_size: 1024
 multimodal_model_path: null
 model_card_path: null
-multimodal_trust_remote_code: false
 retrieval_index_path: null
 retrieval_top_k: 3
 retrieval_embedding_dim: 512

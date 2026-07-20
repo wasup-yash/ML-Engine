@@ -9,9 +9,38 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
+MODEL_FORMATS = frozenset(
+    {
+        "joblib",
+        "pickle",
+        "onnx",
+        "torch",
+        "diffusers",
+        "huggingface",
+        "llava",
+        "openvla",
+        "clip",
+        "vision2seq",
+        "multimodal",
+        "auto",
+    }
+)
+
 DEFAULT_CONFIG = {
     "model_path": "./model.joblib",
     "model_format": None,
+    "allow_empty_model": False,
+    "auth_required": True,
+    "api_key_hashes_env": "ML_ENGINE_API_KEY_HASHES",
+    "rate_limit_requests_per_minute": 600,
+    "cors_allowed_origins": [],
+    "trusted_model_paths": [],
+    "allow_unsafe_deserialization": False,
+    "trusted_remote_code_models": {},
+    "job_store_backend": "sqlite",
+    "job_store_path": "./data/ml-engine-jobs.sqlite3",
+    "artifact_storage_backend": "local",
+    "artifact_storage_root": ".",
     "host": "127.0.0.1",
     "port": 5000,
     "log_level": "INFO",
@@ -24,7 +53,6 @@ DEFAULT_CONFIG = {
     "batch_max_queue_size": 1024,
     "multimodal_model_path": None,
     "model_card_path": None,
-    "multimodal_trust_remote_code": False,
     "retrieval_index_path": None,
     "retrieval_top_k": 3,
     "retrieval_embedding_dim": 512,
@@ -57,29 +85,40 @@ def load_config_from_yaml(config_path: str) -> Dict[str, Any]:
     return config
 
 
+def validate_config(config: Dict[str, Any]) -> None:
+    model_format = config.get("model_format")
+    if model_format is not None and str(model_format).lower() not in MODEL_FORMATS:
+        supported = ", ".join(sorted(MODEL_FORMATS))
+        raise ValueError(f"Unsupported model_format {model_format!r}. Supported values: {supported}")
+    if not isinstance(config.get("trusted_model_paths", []), list):
+        raise ValueError("trusted_model_paths must be a list")
+    if not isinstance(config.get("trusted_remote_code_models", {}), dict):
+        raise ValueError("trusted_remote_code_models must be a mapping")
+    if config.get("job_store_backend", "sqlite") != "sqlite":
+        raise ValueError("Only sqlite job_store_backend is bundled; use an external store adapter for replicas")
+    if config.get("artifact_storage_backend", "local") not in {"local", "s3", "gcs"}:
+        raise ValueError("artifact_storage_backend must be local, s3, or gcs")
+
+
 def parse_args() -> Dict[str, Any]:
     parser = argparse.ArgumentParser(description="ML Model Serving Engine")
 
     parser.add_argument("--config", type=str, help="Path to configuration file (YAML)")
     parser.add_argument("--model_path", type=str, help="Path to the model file")
     parser.add_argument(
+        "--allow_empty_model",
+        action="store_true",
+        default=None,
+        help="Start the API without a loaded model; prediction routes return 503 until one is loaded",
+    )
+    parser.add_argument("--auth_required", action="store_true", default=None)
+    parser.add_argument("--api_key_hashes_env", type=str)
+    parser.add_argument("--rate_limit_requests_per_minute", type=int)
+    parser.add_argument("--allow_unsafe_deserialization", action="store_true", default=None)
+    parser.add_argument(
         "--model_format",
         type=str,
-        choices=[
-            "joblib",
-            "pickle",
-            "onnx",
-            "torch",
-            "tensorflow",
-            "diffusers",
-            "huggingface",
-            "llava",
-            "openvla",
-            "clip",
-            "vision2seq",
-            "multimodal",
-            "auto",
-        ],
+        choices=sorted(MODEL_FORMATS),
         help="Format of the model file (if not auto-detected)",
     )
     parser.add_argument("--host", type=str, help="Host address for the API server")
@@ -121,12 +160,6 @@ def parse_args() -> Dict[str, Any]:
     )
     parser.add_argument("--multimodal_model_path", type=str, help="Path or HF id for multimodal model")
     parser.add_argument("--model_card_path", type=str, help="Path to model card file for type detection")
-    parser.add_argument(
-        "--multimodal_trust_remote_code",
-        action="store_true",
-        default=None,
-        help="Allow execution of custom model repository code",
-    )
     parser.add_argument("--retrieval_index_path", type=str, help="Path to FAISS retrieval index")
     parser.add_argument("--retrieval_top_k", type=int, help="Top-k retrieval results to inject as context")
     parser.add_argument("--retrieval_embedding_dim", type=int, help="Embedding dimension for new FAISS index")
@@ -179,5 +212,23 @@ def get_config() -> Dict[str, Any]:
         args = {k: v for k, v in args.items() if k != "config"}
 
     config.update(args)
+    for key, default in DEFAULT_CONFIG.items():
+        env_key = f"ML_ENGINE_{key.upper()}"
+        raw_value = os.getenv(env_key)
+        if raw_value is None:
+            continue
+        if isinstance(default, bool):
+            config[key] = raw_value.strip().lower() in {"1", "true", "yes", "on"}
+        elif isinstance(default, int):
+            config[key] = int(raw_value)
+        elif isinstance(default, float):
+            config[key] = float(raw_value)
+        elif isinstance(default, (list, dict)):
+            import json
+
+            config[key] = json.loads(raw_value)
+        else:
+            config[key] = raw_value
+    validate_config(config)
     logger.info(f"Final configuration: {config}")
     return config
