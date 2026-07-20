@@ -32,6 +32,9 @@ adapter_upload_max_bytes: 4294967296
 benchmark_warmup_calls: 20
 benchmark_timed_calls: 100
 metrics_gpu_poll_interval_sec: 1.0
+gpu_memory_reserve_bytes: 536870912
+projected_finetune_gpu_bytes: 0
+projected_model_load_gpu_bytes: 0
 model_variants: {}
 traffic_split: {}
 shadow_model: null

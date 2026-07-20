@@ -93,6 +93,17 @@ class MetricsCollector:
         if self._gpu_thread and self._gpu_thread.is_alive():
             self._gpu_thread.join(timeout=2.0)
 
+    def gpu_memory_info(self) -> Optional[Dict[str, int]]:
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+            memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return {"total": int(memory.total), "used": int(memory.used), "free": int(memory.free)}
+        except Exception:
+            return None
+
     def render_prometheus(self) -> Dict[str, Any]:
         payload = generate_latest(self.registry)
         return {"content": payload, "content_type": CONTENT_TYPE_LATEST}

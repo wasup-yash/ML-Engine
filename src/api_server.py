@@ -26,6 +26,7 @@ from src.dynamic_batcher import AsyncBatcher
 from src.finetune_engine import run_lora_finetune
 from src.inference_engine import batch_inference
 from src.logger import get_logger
+from src.logger import request_id_var, tenant_id_var
 from src.metrics_collector import MetricsCollector
 from src.model_loader import load_model
 from src.model_registry import ModelRegistry
@@ -38,6 +39,7 @@ from src.security import (
 )
 from src.state_store import SQLiteJobStore
 from src.storage import create_artifact_storage
+from src.tracing import request_span
 
 logger = get_logger(__name__)
 
@@ -346,6 +348,22 @@ class APIServer:
             logger.exception("Fine-tune job failed")
             self.job_store.update(job_id, "failed", {"error": str(e)})
 
+    def _ensure_gpu_capacity(self, projected_bytes: int) -> None:
+        if projected_bytes <= 0:
+            return
+        memory = self.metrics.gpu_memory_info()
+        if memory is None:
+            return
+        reserve = int(self.config.get("gpu_memory_reserve_bytes", 0))
+        if projected_bytes + reserve > memory["free"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Insufficient GPU memory for requested operation: "
+                    f"free={memory['free']} projected={projected_bytes} reserve={reserve}"
+                ),
+            )
+
     def _decode_frame(self, frame_b64: str) -> np.ndarray:
         payload = frame_b64
         if "," in frame_b64 and frame_b64.strip().startswith("data:"):
@@ -446,6 +464,9 @@ class APIServer:
     def _register_routes(self) -> None:
         @self.app.middleware("http")
         async def _hook_middleware(request, call_next):
+            request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+            request_token = request_id_var.set(request_id)
+            tenant_token = None
             if request.method != "OPTIONS" and request.url.path != "/health":
                 required_scope = (
                     "admin"
@@ -458,33 +479,45 @@ class APIServer:
                     if not self.rate_limiter.check(principal.key_id):
                         return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
                     request.state.principal = principal
+                    tenant_token = tenant_id_var.set(principal.tenant_id)
                 except AuthenticationError as exc:
+                    request_id_var.reset(request_token)
                     return JSONResponse(status_code=401, content={"detail": str(exc)})
                 except AuthorizationError as exc:
+                    request_id_var.reset(request_token)
+                    if tenant_token is not None:
+                        tenant_id_var.reset(tenant_token)
                     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
-            for hook in self.pre_hooks:
-                try:
-                    maybe = hook(request)
-                    if inspect.isawaitable(maybe):
-                        await maybe
-                except Exception:
-                    logger.exception("Pre-hook failed")
+            try:
+                for hook in self.pre_hooks:
+                    try:
+                        maybe = hook(request)
+                        if inspect.isawaitable(maybe):
+                            await maybe
+                    except Exception:
+                        logger.exception("Pre-hook failed")
 
-            response = await call_next(request)
+                with request_span(f"http {request.method} {request.url.path}"):
+                    response = await call_next(request)
 
-            for hook in self.post_hooks:
-                try:
-                    maybe = hook(response)
-                    if inspect.isawaitable(maybe):
-                        await maybe
-                except Exception:
-                    logger.exception("Post-hook failed")
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            response.headers["Referrer-Policy"] = "no-referrer"
-            response.headers["Cache-Control"] = "no-store"
-            return response
+                for hook in self.post_hooks:
+                    try:
+                        maybe = hook(response)
+                        if inspect.isawaitable(maybe):
+                            await maybe
+                    except Exception:
+                        logger.exception("Post-hook failed")
+                response.headers["X-Request-ID"] = request_id
+                response.headers["X-Content-Type-Options"] = "nosniff"
+                response.headers["X-Frame-Options"] = "DENY"
+                response.headers["Referrer-Policy"] = "no-referrer"
+                response.headers["Cache-Control"] = "no-store"
+                return response
+            finally:
+                request_id_var.reset(request_token)
+                if tenant_token is not None:
+                    tenant_id_var.reset(tenant_token)
 
         @self.app.get("/")
         def root() -> Dict[str, str]:
@@ -684,6 +717,7 @@ class APIServer:
         @self.app.post("/upload_model")
         async def upload_model(file: UploadFile) -> Dict[str, str]:
             try:
+                self._ensure_gpu_capacity(int(self.config.get("projected_model_load_gpu_bytes", 0)))
                 model_format = (self.config.get("model_format") or "").lower()
                 if model_format != "onnx":
                     raise HTTPException(
@@ -716,6 +750,7 @@ class APIServer:
         async def finetune(request: FineTuneRequest, http_request: Request) -> Dict[str, str]:
             job_id = str(uuid.uuid4())
             tenant_id = http_request.state.principal.tenant_id
+            self._ensure_gpu_capacity(int(self.config.get("projected_finetune_gpu_bytes", 0)))
             if self.job_store.active_count(tenant_id) > 0:
                 raise HTTPException(status_code=409, detail="A fine-tune job is already active")
             self.job_store.create(job_id, tenant_id, {"dataset_size": len(request.dataset)})
