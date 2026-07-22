@@ -26,9 +26,10 @@ class Principal:
 class APIKeyAuthenticator:
     """Authenticates SHA-256 hashed API keys supplied via an environment variable."""
 
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any], tenant_store: Any = None) -> None:
         self.required = bool(config.get("auth_required", True))
         self.hashes_env = str(config.get("api_key_hashes_env", "ML_ENGINE_API_KEY_HASHES"))
+        self.tenant_store = tenant_store
         self._keys = self._load_keys()
 
         if self.required and not self._keys:
@@ -68,6 +69,10 @@ class APIKeyAuthenticator:
         candidate = hashlib.sha256(supplied_key.encode("utf-8")).hexdigest()
         for key_hash, principal in self._keys.items():
             if hmac.compare_digest(candidate, key_hash):
+                if self.tenant_store is not None and not self.tenant_store.is_key_active(
+                    principal.key_id, principal.tenant_id
+                ):
+                    raise AuthenticationError("API key has been revoked or tenant is inactive")
                 return principal
         raise AuthenticationError("Invalid API key")
 
@@ -83,7 +88,8 @@ class FixedWindowRateLimiter:
         self._lock = Lock()
         self._windows: Dict[str, tuple[int, int]] = {}
 
-    def check(self, key_id: str) -> bool:
+    def check(self, key_id: str, requests_per_minute: int | None = None) -> bool:
+        limit = max(1, int(requests_per_minute or self.requests_per_minute))
         now = int(time.time())
         window = now // 60
         with self._lock:
@@ -92,7 +98,7 @@ class FixedWindowRateLimiter:
                 count = 0
             count += 1
             self._windows[key_id] = (window, count)
-            return count <= self.requests_per_minute
+            return count <= limit
 
 
 def is_trusted_path(path: str, trusted_roots: Iterable[str]) -> bool:

@@ -1,7 +1,6 @@
 from typing import Any, Dict, Iterable, Iterator, List
 
 import numpy as np
-import onnxruntime
 
 
 def _infer_single_frame(model: Any, frame: np.ndarray) -> Any:
@@ -10,14 +9,20 @@ def _infer_single_frame(model: Any, frame: np.ndarray) -> Any:
         result = model.predict(frame_batch)
         return result[0] if isinstance(result, (list, np.ndarray)) else result
 
+    if callable(model):
+        return model(frame)
+
+    # ONNX Runtime is an optional model-format dependency. Do not require it
+    # for sklearn-style or callable temporal models.
+    try:
+        import onnxruntime
+    except ImportError as exc:
+        raise ValueError("ONNX Runtime is required for ONNX video inference") from exc
     if isinstance(model, onnxruntime.InferenceSession):
         input_name = model.get_inputs()[0].name
         frame_batch = np.expand_dims(frame, axis=0).astype(np.float32)
         result = model.run(None, {input_name: frame_batch})[0]
         return result[0] if isinstance(result, np.ndarray) and result.ndim > 0 else result
-
-    if callable(model):
-        return model(frame)
 
     raise ValueError("Unsupported model type for video inference")
 

@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, Histogram, generate_latest
 
 from src.logger import get_logger
+from src.logger import tenant_id_var
 
 logger = get_logger(__name__)
 
@@ -20,13 +21,13 @@ class MetricsCollector:
         self.inference_latency_seconds = Histogram(
             "inference_latency_seconds",
             "Inference latency in seconds",
-            labelnames=("endpoint", "model"),
+            labelnames=("endpoint", "model", "tenant"),
             registry=self.registry,
         )
         self.batch_size_observed = Histogram(
             "batch_size_observed",
             "Observed request batch sizes",
-            labelnames=("endpoint",),
+            labelnames=("endpoint", "tenant"),
             registry=self.registry,
             buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256),
         )
@@ -43,16 +44,20 @@ class MetricsCollector:
         self._gpu_thread: Optional[threading.Thread] = None
 
     @contextmanager
-    def track_inference(self, endpoint: str, model_name: str = "default"):
+    def track_inference(self, endpoint: str, model_name: str = "default", tenant_id: Optional[str] = None):
         start = time.perf_counter()
         try:
             yield
         finally:
             elapsed = time.perf_counter() - start
-            self.inference_latency_seconds.labels(endpoint=endpoint, model=model_name).observe(elapsed)
+            self.inference_latency_seconds.labels(
+                endpoint=endpoint, model=model_name, tenant=tenant_id or tenant_id_var.get()
+            ).observe(elapsed)
 
-    def observe_batch_size(self, endpoint: str, batch_size: int) -> None:
-        self.batch_size_observed.labels(endpoint=endpoint).observe(max(1, int(batch_size)))
+    def observe_batch_size(self, endpoint: str, batch_size: int, tenant_id: Optional[str] = None) -> None:
+        self.batch_size_observed.labels(endpoint=endpoint, tenant=tenant_id or tenant_id_var.get()).observe(
+            max(1, int(batch_size))
+        )
 
     def _gpu_poll_loop(self) -> None:
         try:

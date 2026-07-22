@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, cast
 
 import numpy as np
 import uvicorn
@@ -39,6 +39,7 @@ from src.security import (
 )
 from src.state_store import SQLiteJobStore
 from src.storage import create_artifact_storage
+from src.tenant_store import SQLiteTenantStore
 from src.tracing import request_span
 
 logger = get_logger(__name__)
@@ -64,6 +65,10 @@ class VideoPredictionRequest(BaseModel):
     frames: List[str] = Field(..., description="Base64-encoded frames in temporal order")
 
 
+class TenantQuotaRequest(BaseModel):
+    quotas: Dict[str, int] = Field(default_factory=dict)
+
+
 class APIServer:
     def __init__(
         self,
@@ -82,13 +87,16 @@ class APIServer:
         self._jobs_lock = threading.Lock()
         self._background_tasks: set[asyncio.Task] = set()
         self.job_store = SQLiteJobStore(str(self.config.get("job_store_path")))
+        self.tenant_store = SQLiteTenantStore(
+            str(self.config.get("tenant_store_path")), self.config.get("tenant_default_quotas", {})
+        )
         self.storage = create_artifact_storage(self.config)
-        self.multimodal_bundle = None
+        self.multimodal_bundle: Optional[Any] = None
         self.multimodal_lock = threading.Lock()
         self.retrieval_pipeline: Optional[Any] = None
         self.pre_hooks: List[Any] = []
         self.post_hooks: List[Any] = []
-        self.authenticator = APIKeyAuthenticator(self.config)
+        self.authenticator = APIKeyAuthenticator(self.config, tenant_store=self.tenant_store)
         self.rate_limiter = FixedWindowRateLimiter(
             int(self.config.get("rate_limit_requests_per_minute", 600))
         )
@@ -120,8 +128,10 @@ class APIServer:
         self.plugins: List[Any] = []
         self._register_routes()
         self._load_plugins()
-        self.app.add_event_handler("startup", self.metrics.start_gpu_poller)
-        self.app.add_event_handler("shutdown", self._shutdown)
+        # FastAPI 0.136 removed ``add_event_handler``; these Starlette router
+        # lists remain the compatible lifecycle registration surface.
+        self.app.router.on_startup.append(self.metrics.start_gpu_poller)
+        self.app.router.on_shutdown.append(self._shutdown)
 
     async def _shutdown(self) -> None:
         await self.infer_batcher.close()
@@ -132,6 +142,7 @@ class APIServer:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.metrics.stop_gpu_poller()
         self.job_store.close()
+        self.tenant_store.close()
 
     def _build_model_registry(self, default_model: Any) -> ModelRegistry:
         registry = ModelRegistry(
@@ -180,8 +191,10 @@ class APIServer:
     def _load_plugin(self, plugin_path: str) -> None:
         module_name = os.path.basename(plugin_path)[:-3]
         spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+        if spec is None or spec.loader is None:
+            logger.error(f"Unable to load plugin spec: {plugin_path}")
+            return
         module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
         spec.loader.exec_module(module)
         if hasattr(module, "register"):
             module.register(self)
@@ -199,7 +212,7 @@ class APIServer:
             self.post_hooks.append(hook_func)
             return
         if hook_type in {"startup", "shutdown"}:
-            self.app.add_event_handler(hook_type, hook_func)
+            getattr(self.app.router, f"on_{hook_type}").append(hook_func)
             return
         logger.warning(f"Unsupported hook_type={hook_type}; hook ignored")
 
@@ -207,7 +220,11 @@ class APIServer:
         if self.model is None and not self.model_registry.models:
             raise HTTPException(status_code=503, detail="No model is loaded")
         try:
-            return self.model_registry.route(request_context)
+            tenant_id = tenant_id_var.get()
+            namespaces = self.config.get("tenant_model_namespaces", {}) or {}
+            allowed_models = namespaces.get(tenant_id, namespaces.get("*", ["default"]))
+            context = {**(request_context or {}), "allowed_models": allowed_models}
+            return self.model_registry.route(context)
         except Exception as e:
             logger.error(f"Model routing failed; using default model: {e}")
             return "default", self.model
@@ -372,7 +389,7 @@ class APIServer:
         max_bytes = int(self.config.get("video_max_frame_bytes", 10 * 1024 * 1024))
         if len(frame_bytes) > max_bytes:
             raise ValueError(f"Decoded frame exceeds video_max_frame_bytes={max_bytes}")
-        image = Image.open(BytesIO(frame_bytes))
+        image: Image.Image = Image.open(BytesIO(frame_bytes))
         image.load()
         image = image.convert("RGB")
         return np.array(image)
@@ -464,30 +481,54 @@ class APIServer:
     def _register_routes(self) -> None:
         @self.app.middleware("http")
         async def _hook_middleware(request, call_next):
+            # `/v1` is the supported public namespace; legacy paths remain
+            # available for compatibility until the next API-major release.
+            if request.scope["path"].startswith("/v1/"):
+                request.scope["path"] = request.scope["path"][3:]
             request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
             request_token = request_id_var.set(request_id)
             tenant_token = None
+
+            def rejected(status_code: int, detail: str) -> JSONResponse:
+                response = JSONResponse(status_code=status_code, content={"detail": detail})
+                response.headers["X-Request-ID"] = request_id
+                response.headers["X-Content-Type-Options"] = "nosniff"
+                response.headers["X-Frame-Options"] = "DENY"
+                response.headers["Referrer-Policy"] = "no-referrer"
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
             if request.method != "OPTIONS" and request.url.path != "/health":
                 required_scope = (
                     "admin"
                     if request.url.path in {"/upload_model", "/load_adapter", "/finetune"}
+                    or request.url.path.startswith("/admin/")
                     else "predict"
                 )
                 try:
                     principal = self.authenticator.authenticate(request.headers.get("X-API-Key"))
                     self.authenticator.require_scope(principal, required_scope)
-                    if not self.rate_limiter.check(principal.key_id):
-                        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+                    tenant = self.tenant_store.get(principal.tenant_id)
+                    if not self.rate_limiter.check(
+                        principal.key_id, tenant["quotas"]["requests_per_minute"]
+                    ):
+                        request_id_var.reset(request_token)
+                        return rejected(429, "Rate limit exceeded")
                     request.state.principal = principal
                     tenant_token = tenant_id_var.set(principal.tenant_id)
+                    self.tenant_store.record_usage(
+                        principal.tenant_id,
+                        "http_request",
+                        metadata={"path": request.url.path, "method": request.method},
+                    )
                 except AuthenticationError as exc:
                     request_id_var.reset(request_token)
-                    return JSONResponse(status_code=401, content={"detail": str(exc)})
+                    return rejected(401, str(exc))
                 except AuthorizationError as exc:
                     request_id_var.reset(request_token)
                     if tenant_token is not None:
                         tenant_id_var.reset(tenant_token)
-                    return JSONResponse(status_code=403, content={"detail": str(exc)})
+                    return rejected(403, str(exc))
 
             try:
                 for hook in self.pre_hooks:
@@ -524,17 +565,19 @@ class APIServer:
             return {"message": "ML Model Serving API is running"}
 
         @self.app.get("/health")
-        def health() -> Dict[str, str]:
+        def health() -> Dict[str, Any]:
+            gpu_memory = self.metrics.gpu_memory_info()
             return {
                 "status": "ok",
-                "model_loaded": str(bool(self.model_registry.models)).lower(),
-                "job_queue_depth": str(self.job_store.active_count()),
+                "model_loaded": bool(self.model_registry.models),
+                "job_queue_depth": self.job_store.active_count(),
+                "gpu": {"available": gpu_memory is not None, "memory": gpu_memory},
             }
 
         @self.app.post("/predict", response_model=PredictionResponse)
         async def predict(input_data: PredictionInput) -> Dict[str, Any]:
             try:
-                data = input_data.data
+                data = cast(Union[List[List[float]], List[float], Dict[str, Any]], input_data.data)
                 model_name, model = self._route_model({"endpoint": "/predict"})
                 self.metrics.observe_batch_size("/predict", self._sample_count(data))
 
@@ -545,6 +588,8 @@ class APIServer:
                 )
                 result = self._normalize_for_json(result)
                 return {"prediction": result}
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Prediction error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
@@ -561,10 +606,14 @@ class APIServer:
                     model_name, model = self._route_model({"endpoint": "/infer"})
                     submissions.append(self.infer_batcher.submit((model_name, model, sample)))
                     self._schedule_background(
-                        self._run_shadow_prediction("/infer", model_name, sample)
+                        self._run_shadow_prediction(
+                            "/infer", model_name, cast(Union[List[float], List[List[float]]], sample)
+                        )
                     )
                 results = await asyncio.gather(*submissions)
                 return {"results": self._normalize_for_json(results)}
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Inference error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
@@ -582,7 +631,7 @@ class APIServer:
                 if not text:
                     raise ValueError("payload.text is required")
 
-                pil_image = None
+                pil_image: Optional[Image.Image] = None
                 if image is not None:
                     image_bytes = await self._read_upload(
                         image,
@@ -666,6 +715,8 @@ class APIServer:
 
                 media_type = self.config.get("video_stream_media_type", "application/jsonl")
                 return StreamingResponse(stream(), media_type=media_type)
+            except HTTPException:
+                raise
             except (ValueError, binascii.Error) as e:
                 raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
@@ -708,6 +759,8 @@ class APIServer:
                     "latency_seconds": {"p50": p50, "p95": p95, "p99": p99},
                     "throughput_rps": throughput,
                 }
+            except HTTPException:
+                raise
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
@@ -715,7 +768,7 @@ class APIServer:
                 raise HTTPException(status_code=500, detail=f"Benchmark error: {str(e)}")
 
         @self.app.post("/upload_model")
-        async def upload_model(file: UploadFile) -> Dict[str, str]:
+        async def upload_model(file: UploadFile, request: Request) -> Dict[str, str]:
             try:
                 self._ensure_gpu_capacity(int(self.config.get("projected_model_load_gpu_bytes", 0)))
                 model_format = (self.config.get("model_format") or "").lower()
@@ -738,7 +791,11 @@ class APIServer:
                 with self.model_lock:
                     self.model = loaded_model
                     self.model_registry.add_model("default", self.model)
-                logger.info("Model reloaded successfully")
+                logger.info(
+                    "audit_event=model_upload tenant=%s filename=%s format=onnx",
+                    request.state.principal.tenant_id,
+                    os.path.basename(file.filename or ""),
+                )
                 return {"message": "Model reloaded successfully"}
             except HTTPException:
                 raise
@@ -751,9 +808,16 @@ class APIServer:
             job_id = str(uuid.uuid4())
             tenant_id = http_request.state.principal.tenant_id
             self._ensure_gpu_capacity(int(self.config.get("projected_finetune_gpu_bytes", 0)))
-            if self.job_store.active_count(tenant_id) > 0:
-                raise HTTPException(status_code=409, detail="A fine-tune job is already active")
+            quota = self.tenant_store.get(tenant_id)["quotas"]["max_concurrent_jobs"]
+            if self.job_store.active_count(tenant_id) >= quota:
+                raise HTTPException(status_code=409, detail="Tenant fine-tune concurrency quota exceeded")
             self.job_store.create(job_id, tenant_id, {"dataset_size": len(request.dataset)})
+            logger.info(
+                "audit_event=finetune_launch tenant=%s job_id=%s dataset_size=%d",
+                tenant_id,
+                job_id,
+                len(request.dataset),
+            )
 
             worker = threading.Thread(
                 target=self._run_finetune_job,
@@ -772,6 +836,7 @@ class APIServer:
 
         @self.app.post("/load_adapter")
         async def load_adapter_endpoint(
+            request: Request,
             adapter_path: Optional[str] = Form(None),
             merge: bool = Form(False),
             file: Optional[UploadFile] = File(None),
@@ -821,12 +886,40 @@ class APIServer:
 
                 self.config["adapter_path"] = resolved_path
                 self.config["merge_adapter"] = merge
+                logger.info(
+                    "audit_event=adapter_load tenant=%s adapter_path=%s merged=%s",
+                    request.state.principal.tenant_id,
+                    os.path.basename(str(resolved_path)),
+                    merge,
+                )
                 return {"message": "Adapter loaded successfully", "adapter_path": resolved_path}
             except HTTPException:
                 raise
             except Exception as e:
                 logger.error(f"Adapter load error: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Adapter load error: {str(e)}")
+
+        @self.app.get("/admin/tenants")
+        async def list_tenants() -> Dict[str, Any]:
+            return {"tenants": self.tenant_store.list()}
+
+        @self.app.post("/admin/tenants/{tenant_id}")
+        async def upsert_tenant(tenant_id: str, payload: TenantQuotaRequest) -> Dict[str, Any]:
+            return self.tenant_store.create_or_update(tenant_id, payload.quotas)
+
+        @self.app.get("/admin/models")
+        async def list_models() -> Dict[str, Any]:
+            return {"models": sorted(self.model_registry.models.keys())}
+
+        @self.app.get("/admin/jobs")
+        async def list_jobs() -> Dict[str, Any]:
+            return {"jobs": self.job_store.list()}
+
+        @self.app.post("/admin/keys/{key_id}/revoke")
+        async def revoke_key(key_id: str) -> Dict[str, str]:
+            self.tenant_store.revoke_key(key_id)
+            logger.info("audit_event=key_revocation key_id=%s", key_id)
+            return {"key_id": key_id, "status": "revoked"}
 
     def run(self) -> None:
         logger.info(f"Starting API server on {self.host}:{self.port}")

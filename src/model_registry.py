@@ -35,24 +35,32 @@ class ModelRegistry:
             self.shadow_model = name
 
     def route(self, request: Optional[Dict[str, Any]] = None) -> Tuple[str, Any]:
-        del request
+        allowed_models = set((request or {}).get("allowed_models", []))
         with self._lock:
             if not self.models:
                 raise ValueError("ModelRegistry has no models")
 
+            available_models = {
+                name: model
+                for name, model in self.models.items()
+                if not allowed_models or name in allowed_models
+            }
+            if not available_models:
+                raise ValueError("No models are available in this tenant namespace")
+
             if not self.traffic_split:
-                first_name = next(iter(self.models.keys()))
-                return first_name, self.models[first_name]
+                first_name = next(iter(available_models.keys()))
+                return first_name, available_models[first_name]
 
             available_split = {
                 name: weight
                 for name, weight in self.traffic_split.items()
-                if name in self.models and weight > 0
+                if name in available_models and weight > 0
             }
             total = sum(available_split.values())
             if total <= 0:
-                first_name = next(iter(self.models.keys()))
-                return first_name, self.models[first_name]
+                first_name = next(iter(available_models.keys()))
+                return first_name, available_models[first_name]
 
             sample = random.random() * total
             cumulative = 0.0
@@ -64,8 +72,8 @@ class ModelRegistry:
                     break
 
             if chosen_name is None:
-                chosen_name = next(iter(self.models.keys()))
-            return chosen_name, self.models[chosen_name]
+                chosen_name = next(iter(available_models.keys()))
+            return chosen_name, available_models[chosen_name]
 
     def get_shadow(self) -> Optional[Tuple[str, Any]]:
         with self._lock:

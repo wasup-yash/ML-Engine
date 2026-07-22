@@ -1,6 +1,4 @@
 import os
-import torch
-from transformers import AutoModel  
 
 class ModelZoo:
     @classmethod
@@ -15,6 +13,10 @@ class ModelZoo:
 
     @staticmethod
     def _download_huggingface(model_name, output_dir):
+        # Keep this optional utility import-safe when serving non-torch models.
+        import torch
+        from transformers import AutoModel
+
         model = AutoModel.from_pretrained(model_name)
         output_path = os.path.join(output_dir, f"{model_name.replace('/', '_')}.pt")
         torch.save(model.state_dict(), output_path)

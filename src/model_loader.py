@@ -73,7 +73,7 @@ def _detect_format(model_path: str) -> str:
 def _load_huggingface_model(model_path: str, quantization: Optional[str]) -> Any:
     from transformers import AutoModel, AutoModelForCausalLM
 
-    kwargs = {"local_files_only": True}
+    kwargs: dict[str, Any] = {"local_files_only": True}
     if quantization:
         from transformers import BitsAndBytesConfig
 

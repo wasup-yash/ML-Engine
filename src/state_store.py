@@ -80,6 +80,17 @@ class SQLiteJobStore:
         with self._lock:
             return int(self._connection.execute(query, params).fetchone()[0])
 
+    def list(self, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = "SELECT id FROM jobs"
+        params: List[Any] = []
+        if tenant_id is not None:
+            query += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        query += " ORDER BY created_at DESC"
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        return [self.get(row["id"]) for row in rows]
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()

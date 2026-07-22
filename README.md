@@ -1,129 +1,72 @@
-# ML Model Serving Engine
+# ML Serving Engine
 
-A lightweight engine for serving machine learning models via a REST API.
+ML Serving Engine is a self-hostable inference service for classical, ONNX, PyTorch/Hugging Face, multimodal, video, LoRA-adapted, and Diffusers workloads. It provides one secured and observable API surface instead of a bespoke FastAPI wrapper per model team.
 
-## Features
+## What is shipped
 
-- Load ML models saved in standard formats (joblib, pickle, onnx, pytorch, Tensorflow Savedmodel)
- - Added a /predict_multimodal endpoint accepting image + text payloads, routing to a VLA model (e.g. LLaVA, OpenVLA) for grounded predictions
-- a multimodal retrieval pipeline — embed uploaded images/text into a vector store and retrieve relevant context before inference
-- Added a /finetune endpoint that accepts a small labelled dataset and runs LoRA/QLoRA fine-tuning on a loaded base model in-place, then hot-swaps the adapter weights without server restart
-- Support loading models with merged or separate LoRA adapter files (.safetensors) alongside the base model, configurable via YAML
+- Explicit model-format loading with INT8/INT4 configuration, LoRA adapter load/merge, and Diffusers directory detection.
+- `/predict`, dynamically batched `/infer`, multipart `/predict_multimodal`, streaming `/predict_video`, async `/finetune`, `/benchmark`, `/metrics`, and model-version routing/shadowing.
+- Scoped API-key authentication, per-key rate limiting, CORS allowlisting, structured JSON logs, request IDs, OpenTelemetry hooks, audit events, and Prometheus metrics.
+- Durable SQLite fine-tune job state, local artifact-storage boundary, GPU-memory admission guardrails, and non-root container execution.
 
- - Added a /predict_video endpoint that accepts a sequence of frames and runs temporal inference (useful for action recognition or latent diffusion pipelines)
-- Support loading rectified flow / diffusion model checkpoints (.safetensors, diffusers format) as a first-class model format in model_loader.py
+See [deployment guidance](docs/DEPLOYMENT.md), the [security review](docs/SECURITY.md), [on-call runbook](docs/RUNBOOK.md), and [B2B overview](docs/WHY_BUY.md).
+Measured results and reproduction instructions are in [the benchmark baseline](docs/BENCHMARKS.md).
 
-- Added INT8/INT4 quantisation support via bitsandbytes or torch.ao.quantization at model load time, configurable with a quantization key in the YAML config
-- Implemented dynamic batching with configurable max_wait_ms and max_batch_size to maximise GPU throughput under concurrent requests
-Add a /benchmark endpoint that runs a warmup + timed inference loop and reports latency percentiles (p50/p95/p99) and throughput
+## Quickstart
 
-- Observability / MLOps support
-
-  - Expose a /metrics endpoint (Prometheus-compatible) tracking inference latency, batch sizes, model load time, and GPU memory utilisation via pynvml
-
-- Added model versioning support — load multiple model variants and route traffic between them via a config-driven A/B split or shadow mode
-
-## Quick Start
-
-### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/ml-serving-engine.git
-   cd ml-serving-engine
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-### Running the Engine
-
-1. With default configuration (looks for `model.joblib` in current directory):
-   ```bash
-   python run_engine.py
-   ```
-
-2. With a configuration file:
-   ```bash
-   python run_engine.py --config config/default_config.yaml
-   ```
-
-3. With command-line arguments:
-   ```bash
-   python run_engine.py --model_path ./models/my_model.joblib --host 0.0.0.0 --port 8000
-   ```
-
-### Using the API
-
-Once the engine is running, you can make predictions via the API:
+Requires Python 3.10-3.13. Install the pinned runtime dependencies:
 
 ```bash
-curl -X POST "http://localhost:5000/predict" \
-  -H "Content-Type: application/json" \
-  -d '{"data": [5.1, 3.5, 1.4, 0.2]}'
+python -m pip install -r requirements.txt
 ```
 
-Response:
-```json
-{
-  "prediction": [0]
-}
+For a local readiness check without a model or credentials:
+
+```bash
+ML_ENGINE_AUTH_REQUIRED=false python run_engine.py --config config/default_config.yaml --allow_empty_model
+curl http://127.0.0.1:5000/health
 ```
 
-You can also visit the auto-generated API documentation at: `http://localhost:5000/docs`
+The expected response includes `status`, `model_loaded`, and `job_queue_depth`. A no-model instance returns 503 from prediction routes by design.
 
-## Configuration Options
+For production, leave authentication enabled, inject a hashed API-key map through `ML_ENGINE_API_KEY_HASHES`, and use an explicit model format. Example request:
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `model_path` | Path to the model file | `./model.joblib` |
-| `model_format` | Format of the model file (auto-detect if not specified) | `null` |
-| `host` | Host address to bind the server | `127.0.0.1` |
-| `port` | Port to bind the server | `5000` |
-| `log_level` | Logging level | `INFO` |
-
-## API Endpoints
-
-- `GET /` - Root endpoint (health check)
-- `GET /health` - Health check endpoint
-- `POST /predict` - Make predictions using the loaded model
-
-## Example YAML Configuration
-
-```yaml
-model_path: "./models/classifier.joblib"
-model_format: "joblib"
-
-host: "0.0.0.0"
-port: 8000
-
-log_level: "INFO"
+```bash
+curl -X POST http://127.0.0.1:5000/predict \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: <raw-api-key>' \
+  -d '{"data":[5.1,3.5,1.4,0.2]}'
 ```
 
-## Creating a Sample Model
+## Safety Defaults
 
-Here's a simple example of creating and saving a model for use with this engine:
+`joblib`, `pickle`, `.pt`, and auto-detected serialized models can execute attacker-controlled code while loading. The service refuses them until both `allow_unsafe_deserialization: true` and an operator-owned `trusted_model_paths` entry are configured. Customer uploads support explicit ONNX only; adapters must pass safetensors-header validation.
 
-```python
-from sklearn.datasets import load_iris
-from sklearn.ensemble import RandomForestClassifier
-import joblib
+Do not place API keys or cloud credentials in YAML. Environment variables override configuration as `ML_ENGINE_<CONFIG_KEY>`; use your secret manager to inject them. `trusted_remote_code_models` is an exact-path allowlist, never a global flag.
 
-iris = load_iris()
-X, y = iris.data, iris.target
+## Operations
 
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X, y)
+`GET /health` is unauthenticated for container orchestration. Every other endpoint requires `predict` or `admin` scope by default. `GET /metrics` exposes Prometheus text; `/benchmark` runs configured warmup/timed loops and reports p50/p95/p99 plus throughput for the selected model.
 
-joblib.dump(model, "model.joblib")
+Dynamic batching is local to each process. For GPU models, use one worker per GPU and measure before increasing concurrency. SQLite job state and the in-memory rate limiter are single-instance defaults; use external shared implementations before replica-based deployment.
+
+## Development
+
+```bash
+python -m pip install -r requirements-dev.txt
+ruff check src tests run_engine.py
+mypy src run_engine.py
+coverage run -m unittest discover -s tests -v
+coverage report
 ```
 
-## Phases
+The current suite validates security controls, durable job state, dynamic batching, retrieval fallback behavior, API authentication/rate limiting, and video streaming. The repository uses semantic versioning; changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
-![These are the phases for feature implementation](/ml_engine_feature_plan.svg)
+## Container
 
-## License
+```bash
+docker build -f DOCKERFILE -t ml-serving-engine:0.5.0 .
+docker run --rm -p 5000:5000 -e ML_ENGINE_API_KEY_HASHES="$ML_ENGINE_API_KEY_HASHES" ml-serving-engine:0.5.0
+```
 
-This project is licensed under the MIT License.
+The container is intentionally not configured with a development key. It will fail closed if authentication is enabled and the key-hash environment variable is missing.

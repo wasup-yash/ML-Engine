@@ -10,6 +10,11 @@ allow_unsafe_deserialization: false
 trusted_remote_code_models: {}
 job_store_backend: "sqlite"
 job_store_path: "./data/ml-engine-jobs.sqlite3"
+tenant_store_path: "./data/ml-engine-tenants.sqlite3"
+tenant_default_quotas:
+  max_concurrent_jobs: 1
+  requests_per_minute: 600
+tenant_model_namespaces: {}
 artifact_storage_backend: "local"
 artifact_storage_root: "."
 quantization: null

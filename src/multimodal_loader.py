@@ -189,7 +189,7 @@ def run_multimodal_inference(
             similarity = outputs.logits_per_image.squeeze().float().cpu().item()
         return {"type": "clip_similarity", "score": similarity}
 
-    processor_kwargs = {"text": prompt, "return_tensors": "pt"}
+    processor_kwargs: Dict[str, Any] = {"text": prompt, "return_tensors": "pt"}
     if image is not None:
         processor_kwargs["images"] = image
     inputs = bundle.processor(**processor_kwargs)

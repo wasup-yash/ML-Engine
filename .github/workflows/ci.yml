@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: ruff check src tests run_engine.py
+      - run: mypy src run_engine.py
+      - run: coverage run -m unittest discover -s tests -v
+      - run: coverage report
+      - run: docker build -f DOCKERFILE -t ml-serving-engine:${{ github.sha }} .
+      - uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ml-serving-engine:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ml-serving-engine:${{ github.sha }}
+          artifact-name: sbom.spdx.json

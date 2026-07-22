@@ -2,7 +2,6 @@ import os
 import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from src.model_loader import load_model
 
 class ModelFileChangeHandler(FileSystemEventHandler):
     def __init__(self, model_path: str, reload_callback):

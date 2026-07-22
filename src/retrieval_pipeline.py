@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import faiss
 import numpy as np
-import torch
 from PIL import Image
 
 from src.logger import get_logger
@@ -68,6 +67,10 @@ class RetrievalPipeline:
         if not hasattr(self.model, "get_text_features"):
             return None
 
+        # The deterministic FAISS fallback must work without a torch installation.
+        # Only import torch when a CLIP-like encoder was actually configured.
+        import torch
+
         inputs = self.processor(text=[text], return_tensors="pt", padding=True, truncation=True)
         device = next(self.model.parameters()).device
         inputs = {
@@ -87,6 +90,8 @@ class RetrievalPipeline:
             return None
         if not hasattr(self.model, "get_image_features"):
             return None
+
+        import torch
 
         inputs = self.processor(images=image, return_tensors="pt")
         device = next(self.model.parameters()).device
@@ -118,7 +123,7 @@ class RetrievalPipeline:
         raise TypeError("embed expects either a string or PIL.Image.Image")
 
     def add(self, text_or_image: Union[str, Image.Image], metadata: Optional[Dict[str, Any]] = None) -> int:
-        vector = self.embed(text_or_image).astype(np.float32).reshape(1, -1)
+        vector: np.ndarray = self.embed(text_or_image).astype(np.float32).reshape(1, -1)
         self._validate_dimension(vector)
         with self._lock:
             self.index.add(vector)
@@ -126,7 +131,7 @@ class RetrievalPipeline:
             return len(self.metadata) - 1
 
     def retrieve(self, query: Union[str, Image.Image], top_k: int = 3) -> List[Dict[str, Any]]:
-        vector = self.embed(query).astype(np.float32).reshape(1, -1)
+        vector: np.ndarray = self.embed(query).astype(np.float32).reshape(1, -1)
         self._validate_dimension(vector)
         with self._lock:
             if self.index.ntotal == 0:

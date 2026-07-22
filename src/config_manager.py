@@ -26,7 +26,7 @@ MODEL_FORMATS = frozenset(
     }
 )
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "model_path": "./model.joblib",
     "model_format": None,
     "allow_empty_model": False,
@@ -39,6 +39,9 @@ DEFAULT_CONFIG = {
     "trusted_remote_code_models": {},
     "job_store_backend": "sqlite",
     "job_store_path": "./data/ml-engine-jobs.sqlite3",
+    "tenant_store_path": "./data/ml-engine-tenants.sqlite3",
+    "tenant_default_quotas": {"max_concurrent_jobs": 1, "requests_per_minute": 600},
+    "tenant_model_namespaces": {},
     "artifact_storage_backend": "local",
     "artifact_storage_root": ".",
     "host": "127.0.0.1",
@@ -97,6 +100,10 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("trusted_model_paths must be a list")
     if not isinstance(config.get("trusted_remote_code_models", {}), dict):
         raise ValueError("trusted_remote_code_models must be a mapping")
+    if not isinstance(config.get("tenant_default_quotas", {}), dict):
+        raise ValueError("tenant_default_quotas must be a mapping")
+    if not isinstance(config.get("tenant_model_namespaces", {}), dict):
+        raise ValueError("tenant_model_namespaces must be a mapping")
     if config.get("job_store_backend", "sqlite") != "sqlite":
         raise ValueError("Only sqlite job_store_backend is bundled; use an external store adapter for replicas")
     if config.get("artifact_storage_backend", "local") not in {"local", "s3", "gcs"}:

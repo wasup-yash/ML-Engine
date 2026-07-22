@@ -16,7 +16,7 @@ from PIL import Image
 from src.api_server import APIServer
 from src.config_manager import DEFAULT_CONFIG, validate_config
 from src.dynamic_batcher import AsyncBatcher
-from src.model_loader import validate_model
+from src.model_loader import load_model, validate_model
 from src.model_registry import ModelRegistry
 from src.retrieval_pipeline import RetrievalPipeline
 from src.security import validate_safetensors_file
@@ -137,6 +137,12 @@ class CoreTests(unittest.TestCase):
             rows = [json.loads(line) for line in response.text.strip().splitlines()]
             self.assertEqual([row["frame_index"] for row in rows], [0, 1])
 
+    def test_empty_model_returns_service_unavailable(self):
+        config = DEFAULT_CONFIG.copy()
+        config.update({"auth_required": False, "plugin_dir": "missing-test-plugins"})
+        with TestClient(APIServer(None, config=config).app) as client:
+            self.assertEqual(client.post("/predict", json={"data": [1.0]}).status_code, 503)
+
     def test_authentication_scopes_and_health_exemption(self):
         api_key = "predict-secret"
         key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
@@ -191,6 +197,52 @@ class CoreTests(unittest.TestCase):
             validate_safetensors_file(path)
         finally:
             os.unlink(path)
+
+    def test_unsafe_deserialization_requires_explicit_trusted_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "model.joblib")
+            import joblib
+
+            joblib.dump(RecordingModel(), path)
+            with self.assertRaises(PermissionError):
+                load_model(path, "joblib")
+            model = load_model(
+                path,
+                "joblib",
+                allow_unsafe_deserialization=True,
+                trusted_model_paths=[directory],
+            )
+            self.assertIsInstance(model, RecordingModel)
+
+    def test_rate_limit_rejects_second_authenticated_request_with_security_headers(self):
+        api_key = "rate-limit-secret"
+        key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        config = DEFAULT_CONFIG.copy()
+        config.update(
+            {
+                "plugin_dir": "missing-test-plugins",
+                "auth_required": True,
+                "api_key_hashes_env": "TEST_RATE_LIMIT_KEYS",
+                "rate_limit_requests_per_minute": 1,
+            }
+        )
+        old_value = os.environ.get("TEST_RATE_LIMIT_KEYS")
+        os.environ["TEST_RATE_LIMIT_KEYS"] = json.dumps(
+            {key_hash: {"key_id": "limited", "tenant_id": "tenant-a", "scopes": ["predict"]}}
+        )
+        try:
+            with TestClient(APIServer(RecordingModel(), config=config).app) as client:
+                headers = {"X-API-Key": api_key, "X-Request-ID": "rate-limit-test"}
+                self.assertEqual(client.post("/predict", json={"data": [1.0]}, headers=headers).status_code, 200)
+                response = client.post("/predict", json={"data": [1.0]}, headers=headers)
+                self.assertEqual(response.status_code, 429)
+                self.assertEqual(response.headers["X-Request-ID"], "rate-limit-test")
+                self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        finally:
+            if old_value is None:
+                os.environ.pop("TEST_RATE_LIMIT_KEYS", None)
+            else:
+                os.environ["TEST_RATE_LIMIT_KEYS"] = old_value
 
     def test_sqlite_job_state_survives_store_restart(self):
         with tempfile.TemporaryDirectory() as directory:
